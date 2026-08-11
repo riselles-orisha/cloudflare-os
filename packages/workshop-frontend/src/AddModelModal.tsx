@@ -22,6 +22,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
+  azure: 'Azure AI Foundry',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -31,6 +32,7 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
+  azure: 'Azure API key',
 }
 
 // Example used in the custom-model placeholders for providers that have no suggested models
@@ -144,7 +146,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     }
     setApiToken('')
     setAccountId('')
-    setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
+    setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434'
+      : sel.provider === 'azure' ? 'https://' : '')
   }
 
   const validate = (): boolean => {
@@ -161,6 +164,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     const isOllama = selection?.provider === 'ollama'
     const isCloudflare = selection?.provider === 'cloudflare'
+    const isAzure = selection?.provider === 'azure'
     const showCredentials = !gatewayMode
 
     if (showCredentials && selection && !isOllama && !apiToken.trim()) {
@@ -171,8 +175,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       newErrors.accountId = 'Please enter your Cloudflare account ID'
     }
 
-    if (showCredentials && isOllama && !apiUrl.trim()) {
-      newErrors.apiUrl = 'Please enter the Ollama API URL'
+    if (showCredentials && (isOllama || isAzure) && !apiUrl.trim()) {
+      newErrors.apiUrl = isAzure ? 'Please enter your Azure AI Foundry endpoint URL' : 'Please enter the Ollama API URL'
     }
 
     setErrors(newErrors)
@@ -218,6 +222,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
+  const isAzure = selection?.provider === 'azure'
   const showCredentials = !gatewayMode
 
   // Group options by provider for rendering with visual separators.
@@ -316,8 +321,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                 isOllama
                   ? 'Optional for local Ollama access'
                   : isCloudflare
-                  ? 'An API token with Workers AI Read + Edit permissions (in the dashboard: Workers AI > Use REST API > Create a Workers AI API Token)'
-                  : `Your ${PROVIDER_LABELS[selection.provider]} API token for billing`
+                    ? 'An API token with Workers AI Read + Edit permissions (in the dashboard: Workers AI > Use REST API > Create a Workers AI API Token)'
+                    : `Your ${PROVIDER_LABELS[selection.provider]} API token for billing`
               }
               value={apiToken}
               onValueChange={(v) => { setApiToken(v); setErrors(prev => ({ ...prev, apiToken: '' })) }}
@@ -326,12 +331,12 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             />
           )}
 
-          {/* Ollama API URL (always visible for Ollama) */}
-          {showCredentials && isOllama && (
+          {/* Ollama / Azure API URL (always visible for these providers) */}
+          {showCredentials && (isOllama || isAzure) && (
             <Input
               label="API URL"
-              placeholder="http://localhost:11434"
-              description="URL of your Ollama server"
+              placeholder={isAzure ? 'https://<resource>.services.ai.azure.com/openai/v1' : 'http://localhost:11434'}
+              description={isAzure ? 'Your Azure AI Foundry endpoint URL' : 'URL of your Ollama server'}
               value={apiUrl}
               onChange={(e) => { setApiUrl(e.target.value); setErrors(prev => ({ ...prev, apiUrl: '' })) }}
               error={errors.apiUrl}
@@ -339,8 +344,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             />
           )}
 
-          {/* Advanced Settings for non-Ollama, non-Cloudflare providers */}
-          {showCredentials && selection && !isOllama && !isCloudflare && (
+          {/* Advanced Settings for non-Ollama, non-Cloudflare, non-Azure providers */}
+          {showCredentials && selection && !isOllama && !isCloudflare && !isAzure && (
             <Collapsible.Root
               open={advancedOpen}
               onOpenChange={setAdvancedOpen}

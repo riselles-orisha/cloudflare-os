@@ -38,6 +38,8 @@ const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   google: isTextImageOrPdfMime,
   cloudflare: isTextOrImageMime,
   ollama: isTextOrImageMime,
+  // Azure AI Foundry uses OpenAI-compatible endpoints; PDF bridging applies the same rewrite path.
+  azure: isTextImageOrPdfMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
 
 function sanitizeChatAttachmentMimeType(mimeType: string | undefined): string {

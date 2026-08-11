@@ -99,7 +99,7 @@ export interface PublicApi extends RpcTarget {
   //
   // This API may be disabled when the server uses SSO for authentication.
   createAccount(username: string, displayName: string, passwordHash: Uint8Array)
-      : Promise<string | null>;
+    : Promise<string | null>;
 
   // Fetch blueprint metadata by ID. Returns null if the blueprint doesn't exist. No
   // authentication required (knowing the ID is sufficient, since a blueprint is "just data").
@@ -115,7 +115,7 @@ export interface ConnectedAccountsSubscriber {
   // If `credentialsValid` is false, the account's credentials are known to be expired, and the
   // UI should call reconnectAccount() to fix this if the user tries to select this account.
   add(id: number, description: AccountDescription, vendor: VendorDescription,
-      supportedResources: SupportedResource[], credentialsValid: boolean, vendorId: string): void;
+    supportedResources: SupportedResource[], credentialsValid: boolean, vendorId: string): void;
   remove(id: number): void;
 
   // Called after add() has been called for all accounts known so far.
@@ -177,15 +177,15 @@ const RESERVED_WORDS = new Set([
 export function validateBindingName(name: string): void {
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
-        `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
-        `(letters, digits, and '_', not starting with a digit).`);
+      `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
+      `(letters, digits, and '_', not starting with a digit).`);
   }
   if (RESERVED_WORDS.has(name)) {
     throw new Error(`Invalid binding name "${name}": this is a reserved word in JavaScript.`);
   }
   if (name === "prototype" || name in Object.prototype) {
     throw new Error(
-        `Invalid binding name "${name}": this name collides with a built-in object property.`);
+      `Invalid binding name "${name}": this name collides with a built-in object property.`);
   }
 }
 
@@ -259,7 +259,7 @@ export const OPEN_GADGET_ERROR_CODES = {
 
 /** An expected failure code from `AuthenticatedApi.openGadget()`. */
 export type OpenGadgetErrorCode =
-    typeof OPEN_GADGET_ERROR_CODES[keyof typeof OPEN_GADGET_ERROR_CODES];
+  typeof OPEN_GADGET_ERROR_CODES[keyof typeof OPEN_GADGET_ERROR_CODES];
 
 const OPEN_GADGET_ERROR_MESSAGES: Record<OpenGadgetErrorCode, string> = {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
@@ -268,7 +268,7 @@ const OPEN_GADGET_ERROR_MESSAGES: Record<OpenGadgetErrorCode, string> = {
 
 /** Creates an expected `openGadget()` error with a machine-readable code. */
 export function createOpenGadgetError(
-    code: OpenGadgetErrorCode): Error & { code: OpenGadgetErrorCode } {
+  code: OpenGadgetErrorCode): Error & { code: OpenGadgetErrorCode } {
   return Object.assign(new Error(OPEN_GADGET_ERROR_MESSAGES[code]), { code });
 }
 
@@ -282,7 +282,7 @@ export function getOpenGadgetErrorCode(error: unknown): OpenGadgetErrorCode | un
 
 function isOpenGadgetErrorCode(value: unknown): value is OpenGadgetErrorCode {
   return value === OPEN_GADGET_ERROR_CODES.workspaceNotFound ||
-      value === OPEN_GADGET_ERROR_CODES.workspaceAccessDenied;
+    value === OPEN_GADGET_ERROR_CODES.workspaceAccessDenied;
 }
 
 // Top-level API exposed to the user after they have authenticated.
@@ -381,7 +381,7 @@ export interface AuthenticatedApi extends RpcTarget {
   //
   // TODO(multi-gadget): This should be renamed to openWorkspace().
   openGadget(id: string, shareKey?: string,
-             configureObservers?: RpcStub<ObserverConfigCallback>): Promise<RpcStub<Overseer>>;
+    configureObservers?: RpcStub<ObserverConfigCallback>): Promise<RpcStub<Overseer>>;
 
   // Create a new workspace. It will start out titled "Untitled Workspace".
   //
@@ -430,13 +430,13 @@ export interface AuthenticatedApi extends RpcTarget {
   // `resourceUrlPatterns`, if given, limits the connection to the authorization needed for those
   // grantable resource types (those with `grantable`; see `SupportedResource`). If omitted,
   // authorization for all of the vendor's resource types is requested.
-  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}>;
+  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{ url: string }>;
 
   // Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
   // on a connected account, expanding if needed. Returns a URL to open in a new tab to authorize
   // them, or no url if nothing was needed. The updated grant is observable via
   // subscribeConnectedAccounts().
-  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}>;
+  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{ url?: string }>;
 
   // List the auto-provisioning ("ambient") gatekeepers the user can opt into right now: those set to
   // 'optional' by the admin that the user hasn't added yet. Rendered as an "Available" section on the
@@ -458,8 +458,8 @@ export interface AuthenticatedApi extends RpcTarget {
   // window. When it completes, we want the list of accounts in the Workshop UI to update
   // immediately, to give the user feedback that the account is now connected.
   subscribeConnectedAccounts(
-      subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
-      : Promise<RpcStub<{}>>;
+    subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
+    : Promise<RpcStub<{}>>;
 
   // Remove a connected account, revoking the token.
   disconnectAccount(accountId: number): Promise<void>;
@@ -535,7 +535,7 @@ export interface AuthenticatedApi extends RpcTarget {
   // Re-authenticate a connected account whose credentials have expired (or may be about to
   // expire). Returns the URL to open in a new tab. When the OAuth flow completes, the account
   // is updated and subscribers are notified with credentialsValid: true.
-  reconnectAccount(accountId: number): Promise<{url: string}>;
+  reconnectAccount(accountId: number): Promise<{ url: string }>;
 
   // --- Gatekeeper management apps ---
 
@@ -594,7 +594,7 @@ export const MAX_ANNOUNCEMENT_LENGTH = 2000;
 export type BannerColor = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'brand';
 
 export const BANNER_COLORS: BannerColor[] =
-    ['neutral', 'info', 'success', 'warning', 'danger', 'brand'];
+  ['neutral', 'info', 'success', 'warning', 'danger', 'brand'];
 
 export const DEFAULT_BANNER_COLOR: BannerColor = 'info';
 
@@ -647,9 +647,9 @@ export type AdminResourceVendor = {
   displayName: string;
   logo?: AvatarImage;
 } & (
-  | { autoProvisions: false; enabled: boolean; resources: AdminResource[] }
-  | { autoProvisions: true; ambientMode: AmbientGatekeeperMode }
-);
+    | { autoProvisions: false; enabled: boolean; resources: AdminResource[] }
+    | { autoProvisions: true; ambientMode: AmbientGatekeeperMode }
+  );
 
 // A connectable third-party service: its vendor id, display metadata, and the resource types it
 // offers (empty for an auto-provisioning gatekeeper like the Context Library). Returned by both
@@ -830,7 +830,7 @@ export type AdminFormatPatch = {
   agentHint?: string;
   // Per-field presentation overrides. A field set to null reverts to the blueprint's declaration;
   // a field left absent is unchanged.
-  overrides?: {[K in keyof BlueprintOutput]?: BlueprintOutput[K] | null};
+  overrides?: { [K in keyof BlueprintOutput]?: BlueprintOutput[K] | null };
 };
 
 // A gatekeeper vendor offered as a sign-in method. The login/signup pages render a "Continue with
@@ -917,7 +917,7 @@ export type CloudflareAccountOption = {
 };
 
 // Supported AI providers.
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "azure";
 
 // Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`.
 export type AiGatewayInfo = {
@@ -957,7 +957,7 @@ export const WORKERS_AI_OUTPUT_LIMIT = 32768;
 // leaving the remainder as the prompt budget context compaction sizes against.
 export const SUGGESTED_MODELS: Record<
   AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
+  Record<string, { name: string, contextWindow: number, outputLimit?: number }>
 > = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
@@ -971,19 +971,25 @@ export const SUGGESTED_MODELS: Record<
   "anthropic": {
     // TODO: Include Fable -- but we need an admin option to disable it, since many orgs don't
     //   allow it for ZDR reasons. It's sort of overkill for building gadgets anyway.
-    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000},
-    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000},
-    "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
+    "claude-opus-5": { name: "Claude Opus 5", contextWindow: 1000000 },
+    "claude-sonnet-5": { name: "Claude Sonnet 5", contextWindow: 1000000 },
+    "claude-haiku-4-5": { name: "Claude Haiku 4.5", contextWindow: 200000 },
   },
   "openai": {
-    "gpt-5.6-sol": {name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-luna": {name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-terra": {name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000},
+    "gpt-5.6-sol": { name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000 },
+    "gpt-5.6-luna": { name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000 },
+    "gpt-5.6-terra": { name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000 },
   },
   "google": {
-    "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+    "gemini-3.6-flash": { name: "Gemini 3.6 Flash", contextWindow: 1048576 },
   },
   "ollama": {
+  },
+  "azure": {
+    "gpt-4o": { name: "GPT-4o (Azure)", contextWindow: 128000, outputLimit: 16384 },
+    "gpt-4o-mini": { name: "GPT-4o Mini (Azure)", contextWindow: 128000, outputLimit: 16384 },
+    "gpt-4.1": { name: "GPT-4.1 (Azure)", contextWindow: 1047576, outputLimit: 32768 },
+    "gpt-4.1-mini": { name: "GPT-4.1 Mini (Azure)", contextWindow: 1047576, outputLimit: 32768 },
   },
 };
 
@@ -1042,7 +1048,7 @@ export type GadgetMetadataWithTimestamps = GadgetMetadata & {
 // The icons an output format may be drawn with. A closed set because we want them to look consistent.
 // The glyphs themselves live in the frontend, so only these keys ever cross the wire.
 export const OUTPUT_ICONS = ["fileText", "gridNine", "presentation", "appWindow", "flowArrow",
-    "kanban", "chartBar", "table", "notebook", "listChecks"] as const;
+  "kanban", "chartBar", "table", "notebook", "listChecks"] as const;
 
 // One of `OUTPUT_ICONS`, naming a glyph the frontend knows how to draw.
 export type OutputIcon = typeof OUTPUT_ICONS[number];
@@ -1147,7 +1153,7 @@ export type UiBundle = {
   // TODO: Specify the format of what this URL returns. A raw HTML page doesn't quite work because
   //   the client needs to initialize the sandbox with some platform libraries before loading the
   //   Gadget itself.
-//  url: string;
+  //  url: string;
 
   // Returns the raw JS code to execute in the Gadget iframe.
   // TODO: For now we just return the code but we should switch to serving over HTTP as described
@@ -1302,8 +1308,8 @@ export interface Overseer extends RpcTarget {
   //
   // Disposing the returned `RpcStub` will cancel the subscription.
   subscribeToMetadata(
-      callback: RpcStub<(metadata: GadgetMetadata) => void>)
-      : Promise<RpcStub<{}>>;
+    callback: RpcStub<(metadata: GadgetMetadata) => void>)
+    : Promise<RpcStub<{}>>;
 
   // Receive the current viewer roster, then incremental updates as viewers come and go.
   // A viewer is present for the lifetime of the openGadget() session.
@@ -1346,7 +1352,7 @@ export interface Overseer extends RpcTarget {
   // gadget -- including one still pending in another chat (retry after that chat's changes are
   // accepted or reverted).
   createGadget(title: string, chatId?: number, bindingName?: string)
-      : Promise<RpcStub<GadgetClient>>;
+    : Promise<RpcStub<GadgetClient>>;
 
   // Get the gadget with the given workpiece ID. To allow for pipelining, this throws an
   // exception if there is no such gadget.
@@ -1445,7 +1451,7 @@ export interface Overseer extends RpcTarget {
   // chat's env, under the name the agent chose when it made the request (see
   // `connectionRequest.bindingName`). This marks the request accepted, updates the inline card,
   // and resumes the agent so it can use the resource.
-  acceptConnectionRequest(requestId: string, result: {gatekeeperId: WorkpieceId}): Promise<void>;
+  acceptConnectionRequest(requestId: string, result: { gatekeeperId: WorkpieceId }): Promise<void>;
 
   // Deny an agent's pending connection request. Updates the inline card. Does NOT resume the agent:
   // the turn stays ended so the user can decide what to tell the agent to do instead.
@@ -1504,8 +1510,8 @@ export interface Overseer extends RpcTarget {
   // the transcript can draw it as a chip. Display only -- what the agent reads is the noun, which
   // is already in the text.
   newChat(initialMessage: string | SlashCommandRequest, modelId: string | null,
-          capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-          formats?: MessageFormatRef[]): Promise<number>;
+    capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
+    formats?: MessageFormatRef[]): Promise<number>;
 
   // Send a message to the chat from this client. Sending a message causes the LLM to start
   // running if it isn't already.
@@ -1517,8 +1523,8 @@ export interface Overseer extends RpcTarget {
   // (useful when using chat to talk between humans).
   //
   sendChatMessage(chatId: number, message: string | SlashCommandRequest, modelId: string | null,
-                  capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                  formats?: MessageFormatRef[]): Promise<void>;
+    capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
+    formats?: MessageFormatRef[]): Promise<void>;
 
   // Upload an attachment for use in a future chat message. This way by the time the user wants to
   // send the message, likely uploading is complete. `modelId` determines whether the
@@ -1545,8 +1551,8 @@ export interface Overseer extends RpcTarget {
   // If `options.includeDraft` is true, any current live draft for the chat is first materialized
   // into one durable `changes` message and included in the merge.
   mergeChanges(
-      chatId: number, mergeThrough: number | null,
-      options?: { includeDraft?: boolean }): Promise<void>;
+    chatId: number, mergeThrough: number | null,
+    options?: { includeDraft?: boolean }): Promise<void>;
 
   // Indicates that the user has requested that proposed changes starting from the given sequence
   // number in the chat thread be reverted.
@@ -1635,7 +1641,7 @@ export interface Overseer extends RpcTarget {
   // than their own effective role. Returns the new collaborator's info, or null if the username
   // doesn't correspond to an existing account.
   addCollaborator(username: string, role: CollaboratorRole,
-                  note?: string): Promise<CollaboratorInfo | null>;
+    note?: string): Promise<CollaboratorInfo | null>;
 
   // Remove a collaborator (identified by profile.id).
   //
@@ -1671,7 +1677,7 @@ export interface Overseer extends RpcTarget {
   // access level granted to anyone who redeems the link; the caller may not grant a role higher
   // than their own effective role.
   createShareLink(role: CollaboratorRole, note?: string)
-      : Promise<{ key: string; linkId: string }>;
+    : Promise<{ key: string; linkId: string }>;
 
   // Mint a fresh secret for an existing link so the user can copy a new URL without creating a
   // whole new link. The old secrets remain valid, and revoking the link revokes them all together.
@@ -1838,7 +1844,7 @@ export type AiChatMessageBody = {
   // is the name under which the gadget appears in the creating chat's env (and, once merged, the
   // workspace default binding list); recording it here lets the creating chat pick the name back
   // up on replay.
-  createdGadgets?: {gadgetId: WorkpieceId, title: string, bindingName: string}[];
+  createdGadgets?: { gadgetId: WorkpieceId, title: string, bindingName: string }[];
 
   // Binding edges added to gadgets as part of this batch of changes (by the agent's
   // setGadgetBinding tool, or by the user binding a connection with a chat open -- in the latter
@@ -1846,7 +1852,7 @@ export type AiChatMessageBody = {
   // provisional: the edge is visible only from this chat until a merge through this message
   // makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
   // within the gadget identified by `gadgetId`; `target` is the bound workpiece.
-  addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[];
+  addedBindings?: { gadgetId: WorkpieceId, name: string, target: WorkpieceId }[];
 } | {
   // Indicates that at this point in the chat, the user chose to merge all (non-reverted) changes
   // in this chat up to and including the given sequence number.
@@ -1994,7 +2000,7 @@ export type ChatAttachmentRef = ChatAttachmentHandle & {
 export function isTextLikeAttachmentMimeType(mimeType: string): boolean {
   if (mimeType.startsWith("image/")) return false;
   return mimeType.startsWith("text/") ||
-      /\b(json|javascript|typescript|xml|yaml|csv|markdown)\b/.test(mimeType);
+    /\b(json|javascript|typescript|xml|yaml|csv|markdown)\b/.test(mimeType);
 }
 
 // Describes a tool call performed by an AI agent as part of a message.
@@ -2021,7 +2027,7 @@ export type AiToolCall = {
   // as files, but other workpieces may export other filesystems. Hence, a file is identified by
   // the pair of a workpiece reference (the `workpiece` chat binding name) and `filename`.
   toolName: "readFile";
-  input: {workpiece?: string, filename: string};
+  input: { workpiece?: string, filename: string };
 } | {
   toolName: "writeFile";
   input: {
@@ -2067,7 +2073,7 @@ export type AiToolCall = {
   // an addition whose "changes" message never flushed (see `addedBindings`), mirroring
   // createGadget's recorded output. `changeId` is the change number of the batch that records the
   // addition. Absent only when the call failed (`error` is set).
-  output?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId, changeId: number};
+  output?: { gadgetId: WorkpieceId, name: string, target: WorkpieceId, changeId: number };
 } | {
   // Obsolete predecessor of `setGadgetBinding`, from before named chat bindings; appears only in
   // old chat logs. Its additions were immediate and permanent (nothing provisional to recover),
@@ -2104,7 +2110,7 @@ export type AiToolCall = {
   // `blueprintNotes` is present for blueprint instantiations: formatted text describing the files
   // copied in and the bindings the blueprint expects the agent to wire up. Recorded so replay
   // doesn't have to re-fetch the blueprint (whose content may have changed since).
-  output?: {gadgetId: WorkpieceId, changeId?: number, blueprintNotes?: string};
+  output?: { gadgetId: WorkpieceId, changeId?: number, blueprintNotes?: string };
 } | {
   toolName: "executeCode";
   input: {
@@ -2572,7 +2578,7 @@ export type BlueprintBinding = {
 
   // The blueprint creator may suggest a particular model to use, or omit this to leave
   // it up to the recipient.
-  suggestedModel?: {provider: string, modelName: string};
+  suggestedModel?: { provider: string, modelName: string };
 } | {
   // An agent spawner binding.
   type: "agentSpawner";
@@ -2580,7 +2586,7 @@ export type BlueprintBinding = {
   // The blueprint creator may suggest a particular model to use, or omit this. (The
   // value is `null` if the suggestion is that AgentSpawnerConfig.modelId should be
   // configured as `null`. This is different from `undefined`, which means no suggestion.)
-  suggestedModel?: {provider: string, modelName: string} | null;
+  suggestedModel?: { provider: string, modelName: string } | null;
 
   // Symbolic form of AgentSpawnerConfig.env: env name -> target, resolved to concrete workpiece
   // IDs at instantiation time (see SpawnerEnvTarget).
@@ -2597,7 +2603,7 @@ export const BLUEPRINT_SCREENSHOT_PATH_PREFIX = '/blueprint-screenshot/';
 
 export function blueprintScreenshotUrl(id: string, metadata: { screenshot?: true, lastUpdated: Date }): string | undefined {
   return metadata.screenshot ?
-      `${BLUEPRINT_SCREENSHOT_PATH_PREFIX}${id}?v=${metadata.lastUpdated.valueOf()}` : undefined;
+    `${BLUEPRINT_SCREENSHOT_PATH_PREFIX}${id}?v=${metadata.lastUpdated.valueOf()}` : undefined;
 }
 
 // General metadata about a blueprint. Stored (in slightly different wrapper records) in
@@ -2648,11 +2654,11 @@ export type BlueprintGadgetSummary = {
 // the two cases where it does not, so no caller has to infer that from display text. `workspaceId`
 // is reachable only in the case where opening it is meaningful.
 export type BlueprintSource =
-    // Published from a workspace that still exists. `workspaceTitle` is its current title.
-    { type: "workspace"; workspaceId: string; workspaceTitle: string }
-    // Published from a workspace that has since been deleted.
+  // Published from a workspace that still exists. `workspaceTitle` is its current title.
+  { type: "workspace"; workspaceId: string; workspaceTitle: string }
+  // Published from a workspace that has since been deleted.
   | { type: "deletedWorkspace" }
-    // Added to the user's library rather than published from one of their workspaces.
+  // Added to the user's library rather than published from one of their workspaces.
   | { type: "imported" };
 
 // User-side summary (returned by AuthenticatedApi.listOwnBlueprints and getOwnBlueprint).

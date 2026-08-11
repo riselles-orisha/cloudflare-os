@@ -124,6 +124,8 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
+    // Azure AI Foundry uses OpenAI-compatible models; consult OpenAI catalog for known ids.
+    case "azure": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     default: return undefined;
   }
 }
@@ -231,6 +233,9 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         ...window,
         compat: workersAiCompat(catalog),
       };
+    // Azure AI Foundry is not served through Cloudflare AI Gateway; fall through to direct access.
+    case "azure":
+      return undefined;
     default:
       return undefined;
   }
@@ -587,6 +592,35 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
+    case "azure": {
+      // Azure AI Foundry exposes an OpenAI-compatible endpoint at:
+      //   https://<resource>.services.ai.azure.com/openai/v1  (Foundry)
+      //   https://<resource>.openai.azure.com/openai/deployments/<deployment>  (Azure OpenAI)
+      // Set `apiUrl` to the base of that endpoint. Azure accepts Authorization: Bearer <key>
+      // (the default pi auth header) in addition to the api-key header, so passing apiKey
+      // directly satisfies pi's auth check and works without extra header overrides.
+      if (!config.apiUrl) {
+        throw new Error(
+          "Azure AI Foundry requires an endpoint URL. " +
+          "Set apiUrl to your Foundry endpoint, e.g. " +
+          "https://<resource>.services.ai.azure.com/openai/v1");
+      }
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: catalog?.name ?? config.model,
+          api: "openai-completions",
+          provider: "azure",
+          baseUrl: config.apiUrl,
+          reasoning: catalog?.reasoning ?? true,
+          input: catalog?.input ?? ["text", "image"],
+          cost: catalog?.cost ?? ZERO_COST,
+          ...window,
+        },
+        apiKey: config.apiToken,
+        sessionAffinity,
+      });
+    }
     default:
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);

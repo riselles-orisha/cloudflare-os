@@ -9,12 +9,15 @@ const FORM_STYLE = `
   label { display: block; font-size: 14px; font-weight: 600; color: var(--strong); margin: 0 0 6px; }
   p.hint { margin: 6px 0 0; font-size: 13px; color: var(--subtle); }
 
-  input[type=url] { width: 100%; box-sizing: border-box; padding: 9px 11px; font: inherit;
+  input[type=url], input[type=text] {
+                    width: 100%; box-sizing: border-box; padding: 9px 11px; font: inherit;
                     background: var(--control); color: var(--text);
                     border: 1px solid var(--line); border-radius: 8px; }
-  input[type=url]::placeholder { color: var(--subtle); }
-  input[type=url]:focus { outline: 0; border-color: var(--brand);
-                          box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent); }
+  input[type=url]::placeholder, input[type=text]::placeholder { color: var(--subtle); }
+  input[type=url]:focus, input[type=text]:focus {
+                    outline: 0; border-color: var(--brand);
+                    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent); }
+  .field { margin-top: 16px; }
 
   button { width: 100%; margin-top: 20px; padding: 10px; border: 0; border-radius: 8px;
            background: var(--contrast); color: var(--on-contrast); font: inherit; font-weight: 600;
@@ -39,6 +42,11 @@ export function connectFormHtml(path: string, error?: string): string {
     <p class="hint">Only connect a server you trust. Its own annotations decide which of its tools
     run without asking you and which wait for your approval, and an annotation is only as
     trustworthy as the server that sent it.</p>
+    <div class="field">
+      <label for="clientId">Client ID <span style="font-weight:400;color:var(--subtle)">(optional)</span></label>
+      <input id="clientId" type="text" name="clientId" placeholder="your-client-id">
+      <p class="hint">If the server requires a specific OAuth client ID, enter it here.</p>
+    </div>
     <button type="submit">Continue</button>
   </form>
 </main></body></html>`;

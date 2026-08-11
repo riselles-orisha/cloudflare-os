@@ -273,7 +273,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
   // Probes unauthenticated first, since a 401 is how a server tells us both that it needs OAuth and
   // where its authorization server is.
   async beginConnect(
-    initiationNonce: string, target: ConnectedServer | null,
+    initiationNonce: string, target: ConnectedServer | null, clientId?: string,
   ): Promise<ConnectOutcome> {
     const existing = this.server();
     const server = resolveConnectTarget(existing, target);
@@ -287,10 +287,12 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
     // the new portal's token.
     const generation = this.advanceConnectionGeneration();
     if (existing) this.ctx.storage.kv.delete("mcpSessionId");
+    // Persist a user-supplied client ID so reconnects (which skip the form) still benefit.
+    if (clientId) this.ctx.storage.kv.put("userClientId", clientId);
     if (existing && existing.endpoint !== server.endpoint) {
       this.ctx.storage.kv.put("server", server);
       for (const key of [
-        "tokens", "oauthClient", "oauthDiscovery", "oauthVerifier", "pendingAuth",
+        "tokens", "oauthClient", "oauthDiscovery", "oauthVerifier", "pendingAuth", "userClientId",
       ]) {
         this.ctx.storage.kv.delete(key);
       }
@@ -357,6 +359,12 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
       // stores.
       const oauthServer: ConnectedServer = { ...server, auth: "oauth" };
       this.ctx.storage.kv.put("server", oauthServer);
+       // Pre-seed the OAuth client ID (from this attempt or a prior one) so the OAuth flow skips
+      // dynamic registration. Only seed when no valid client info is already stored.
+      const persistedClientId = this.ctx.storage.kv.get<string>("userClientId");
+      if (persistedClientId && !this.ctx.storage.kv.get("oauthClient")) {
+        this.ctx.storage.kv.put<StoredOAuthClientInformation>("oauthClient", { client_id: persistedClientId });
+      }
       try {
         return await this.beginOAuth(oauthServer, err.resourceMetadataUrl, generation);
       } catch (oauthErr) {

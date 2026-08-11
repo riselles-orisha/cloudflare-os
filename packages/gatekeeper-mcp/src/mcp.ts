@@ -104,7 +104,7 @@ export default {
 
         // A reconnect already knows its endpoint. Ignore a stale or malicious replacement URL.
         if (await account.hasEndpoint()) {
-          return continueConnect(account, initiationNonce, null, env, path);
+          return continueConnect(account, initiationNonce, null, undefined, env, path);
         }
         if (request.method === "GET") {
           if (!(await account.isAwaitingSelection(initiationNonce))) {
@@ -113,8 +113,10 @@ export default {
           return htmlResponse(connectFormHtml(path));
         }
         const form = await request.formData();
+        const clientId = form.get("clientId");
         return continueConnect(
-          account, initiationNonce, String(form.get("url") ?? ""), env, path);
+          account, initiationNonce, String(form.get("url") ?? ""),
+          clientId ? String(clientId) : undefined, env, path);
       },
     });
   },
@@ -126,6 +128,7 @@ async function continueConnect(
   account: DurableObjectStub<McpAccount>,
   initiationNonce: string,
   endpointUrl: string | null,
+  clientId: string | undefined,
   env: Env,
   formPath: string,
 ): Promise<Response> {
@@ -149,7 +152,7 @@ async function continueConnect(
 
   let outcome: ConnectOutcome;
   try {
-    outcome = await account.beginConnect(initiationNonce, target);
+    outcome = await account.beginConnect(initiationNonce, target, clientId);
   } catch (err) {
     logger.warn("connect failed", { event: "connect.failed", error: err });
     return htmlResponse(connectFormHtml(
@@ -314,7 +317,7 @@ export class GatekeeperUserImpl
 // everyone. Carries no props for the same reason.
 @validateRpc()
 export class McpVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
+  verify(): void { }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +432,7 @@ export class McpGatekeeperImpl
     const plural = tools.length === 1 ? "" : "s";
     const snippet = scope.tools
       ? `${scope.tools.length} named MCP tool${scope.tools.length === 1 ? "" : "s"} on ` +
-        `${serverName} \u2014 ${counts}. Other tools are refused.`
+      `${serverName} \u2014 ${counts}. Other tools are refused.`
       : `All ${tools.length} MCP tool${plural} on ${serverName} \u2014 ${counts}.`;
 
     return {
@@ -460,4 +463,4 @@ export class McpGatekeeperImpl
 // Subclassed rather than used directly so `@validateRpc()` is applied in the file that hands the
 // class to a Gadget, where it can be seen.
 @validateRpc()
-class McpSessionImpl extends McpSessionBase {}
+class McpSessionImpl extends McpSessionBase { }
