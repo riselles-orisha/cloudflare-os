@@ -21,7 +21,24 @@ export type ConnectionEnv = InsecureEnv & {
 export type WithClientOptions = {
   // False for a call that may have taken effect, so a dropped session is not retried. See above.
   retryOnExpiry?: boolean;
+  // Hard wall-clock ceiling for the whole `withClient` operation, including `initialize`, `fn`, and
+  // any retry. Prevents an unresponsive MCP endpoint from stalling the caller until the Workers
+  // runtime kills the request with no explanation. Defaults to `DEFAULT_MCP_CALL_TIMEOUT_MS`.
+  timeoutMs?: number;
 };
+
+// Default hard ceiling for a single `withClient` operation. Chosen below the Workers ~30s CPU/wall
+// cancel so a stalled MCP endpoint fails with a clear error rather than a hung-worker cancellation.
+export const DEFAULT_MCP_CALL_TIMEOUT_MS = 15_000;
+
+// Thrown when `withClient` (or a caller such as `fetchTools`) exceeds its `timeoutMs`. Surfaces as a
+// distinct error so UIs can prompt the user to retry or reconnect instead of spinning forever.
+export class McpCallTimeoutError extends Error {
+  constructor(endpoint: string, timeoutMs: number) {
+    super(`MCP call to ${endpoint} did not respond within ${timeoutMs}ms.`);
+    this.name = "McpCallTimeoutError";
+  }
+}
 
 // Everything an account must hand over before a request can be made. One value rather than two
 // getters: every MCP request needs both, and asking separately costs two serialized round trips to
@@ -74,15 +91,38 @@ export async function withClient<T>(
     return result;
   };
 
+  // Ceiling for the whole operation. Without this an unresponsive MCP endpoint would stall the
+  // Worker until the runtime cancelled the request with no diagnostic; callers such as
+  // `getGatekeeperClassFor` then hang the UI. `Promise.race` against a timer surfaces a typed
+  // `McpCallTimeoutError` instead.
+  const timeoutMs = options.timeoutMs ?? DEFAULT_MCP_CALL_TIMEOUT_MS;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new McpCallTimeoutError(endpoint, timeoutMs)), timeoutMs);
+  });
+
   try {
-    if (!sessionId) await client.initialize(clientName(env));
-    return await run();
+    return await Promise.race([
+      (async () => {
+        if (!sessionId) await client.initialize(clientName(env));
+        return await run();
+      })(),
+      timeout,
+    ]);
   } catch (err) {
     if (err instanceof McpSessionExpiredError) {
       if (options.retryOnExpiry !== false) {
         client.sessionId = null;
-        await client.initialize(clientName(env));
-        return await run();
+        // Retry is also raced against the same timer so an endpoint that reliably reaches
+        // `initialize` but stalls afterwards can't hang the caller.
+        return await Promise.race([
+          (async () => {
+            await client.initialize(clientName(env));
+            return await run();
+          })(),
+          timeout,
+        ]);
       }
       // This call is not retried, since it may already have taken effect. The session is gone all
       // the same, so the cached id is dead: left in place it would fail every later call for a
@@ -97,6 +137,10 @@ export async function withClient<T>(
         { cause: err });
     }
     throw err;
+  } finally {
+    // Cancel the timer whether the operation resolved, rejected, or timed out, so a `Promise.race`
+    // winner doesn't leave a pending timer holding the isolate awake.
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }
 }
 

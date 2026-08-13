@@ -308,10 +308,14 @@ export class GatekeeperUserImpl
     // here rather than only in the form that normally builds these URLs.
     const scope = parseToolScope(requested);
     requirePortalServerScope(scope);
-    const [catalog, portalServers] = await Promise.all([
-      fetchTools(this.env, this.#account(), server.endpoint),
-      fetchPortalServers(this.env, this.#account(), server.endpoint),
-    ]);
+    // Sequential rather than `Promise.all`: on a freshly connected account both `withClient` calls
+    // would read `sessionId: null` at the same instant and each fire its own `initialize` against
+    // the portal in parallel. Portals treat the second `initialize` inconsistently -- one branch may
+    // hang, and the DO ends up with a half-finalized session id that poisons every later call until
+    // the user reconnects. Running the tool fetch first lets the account persist a valid session id
+    // before the portal-servers probe reads it, so both calls share one initialize.
+    const catalog = await fetchTools(this.env, this.#account(), server.endpoint);
+    const portalServers = await fetchPortalServers(this.env, this.#account(), server.endpoint);
     const upstream = validateToolScopeAgainstCatalog(
       scope,
       catalog,
