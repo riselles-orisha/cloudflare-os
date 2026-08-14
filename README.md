@@ -27,7 +27,7 @@ Then visit: http://localhost:8787
 
 This runs the whole stack locally on wrangler and workerd. This is not meant for production use, but is a quick way to see what the product does.
 
-Alternatively, you can [deploy to your Cloudflare account](https://github.com/cloudflare/cloudflare-os-starter).
+Alternatively, you can [deploy to your Cloudflare account](https://os.cloudflare.app/deploy).
 
 (More options at the end of this readme.)
 
@@ -175,7 +175,7 @@ This differs from most agent harnesses, where MCP servers are configured upfront
 
 We've built an online flow that helps you deploy to your own Cloudflare account:
 
-https://os.cloudflare.app
+https://os.cloudflare.app/deploy
 
 Or, for more sophisticated deployment, with your gatekeepers and potentially code changes, check out our deployment starter repo:
 
@@ -237,3 +237,12 @@ With that said, we are happy to accept small, trivially-verified PRs that fix a 
 If you have a big idea you'd like us to consider, feel free to [open a discussion](https://github.com/cloudflare/cloudflare-os/discussions) about it.
 
 This policy may change in the future as the project matures. Until then, thank you for your understanding.
+
+## Credits
+
+Cloudflare OS has far too many open source dependencies to list here. But, we'd like to highlight a few that do particularly heavy lifting:
+
+* [Pi](https://pi.dev/) (specifically, `pi-agent-core`), which made it easy to support every LLM provider with one API.
+* [Monaco](https://microsoft.github.io/monaco-editor/) which makes it too easy to embed a beautiful text editor -- for those of us who still look at the code.
+* [Yjs](https://yjs.dev/), which we use extensively to sync code changes between clients and agents and replay histories.
+* [Vite](https://vite.dev/), which makes the development loop so pleasant.

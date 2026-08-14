@@ -5,6 +5,7 @@ import {
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
   GatekeeperUserVerifier, ObservationDescription,
+  stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, exchangeAuthCode,
@@ -56,10 +57,13 @@ function constantTimeEqual(a: string, b: string): boolean {
 type Env = Cloudflare.Env & {
   // Public worker URL without a trailing slash; defaults to the local dev route.
   BASE_URL?: string;
+  // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
+  CLIENT_ID?: string;
+  CLIENT_SECRET?: string;
 };
 
 function getBaseUrl(env: Env) {
-  return (env.BASE_URL || "http://localhost:8787/gatekeeper/slack").replace(/\/+$/, "");
+  return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/slack");
 }
 
 function getBasePath(env: Env) {

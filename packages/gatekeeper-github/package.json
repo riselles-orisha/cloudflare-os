@@ -9,6 +9,7 @@
     "deploy": "pnpm run build:configurator && wrangler deploy",
     "build": "pnpm run build:configurator && tsc",
     "types:check": "pnpm run build:configurator && tsc --noEmit",
+    "test": "vitest run",
     "clean": "rm -rf dist src/generated"
   },
   "dependencies": {
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "typescript": "^5.9.3",
-    "wrangler": "^4.115.0"
+    "vitest": "^4.1.10",
+    "wrangler": "^4.119.0"
   }
 }

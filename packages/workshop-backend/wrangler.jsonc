@@ -94,7 +94,10 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
-    "logs": { "invocation_logs": false }
+    "logs": { "invocation_logs": false },
+    // Traces are free during the beta; spans bill against the Logs quota from 2026-10-01,
+    // so revisit the sampling rate before then.
+    "traces": { "enabled": true, "head_sampling_rate": 0.5 }
   }
 
 }

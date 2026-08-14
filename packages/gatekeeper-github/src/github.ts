@@ -2,6 +2,7 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   ApprovalQueue,
+  stripTrailingSlashes,
   type ActionDescription,
   type AccountDescription,
   type Cursor,
@@ -29,6 +30,7 @@ import {
   type GitHubPullRequestResponse,
   type GitHubPullRequestReviewCommentResponse,
 } from "./github-api";
+import { assertIssueSearchResultsInRepo, buildIssueSearchQuery } from "./github-search";
 import GITHUB_LOGO_SVG from "./github-logo.svg";
 import type {
   GitHubActor,
@@ -108,6 +110,11 @@ type Cached<T> = {
   value: T;
   etag?: string;
   generation: number;
+};
+
+type CachedIssueSearchResult = {
+  html_url: string;
+  summary: GitHubIssueSummary;
 };
 
 type GitHubDiscussionCommentEntry = Extract<GitHubDiscussionEntry, { kind: "comment" }>;
@@ -355,7 +362,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 function getBaseUrl(env: Env): string {
-  return (env.BASE_URL ?? "http://localhost:8787/gatekeeper/github").replace(/\/+$/, "");
+  return stripTrailingSlashes(env.BASE_URL ?? "http://localhost:8787/gatekeeper/github");
 }
 
 function getBasePath(env: Env): string {
@@ -694,17 +701,6 @@ function pullComparator(
     }
     return delta * factor;
   };
-}
-
-function buildIssueSearchQuery(owner: string, repo: string, query: GitHubIssueSearch): string {
-  const parts = [query.text, `repo:${owner}/${repo}`, "is:issue"];
-  if (query.state && query.state !== "all") parts.push(`state:${query.state}`);
-  for (const label of query.labels ?? []) {
-    parts.push(`label:${JSON.stringify(label)}`);
-  }
-  if (query.author) parts.push(`author:${query.author}`);
-  if (query.assignee) parts.push(`assignee:${query.assignee}`);
-  return parts.filter(Boolean).join(" ");
 }
 
 function parseDiffSide(side?: "LEFT" | "RIGHT" | null): "old" | "new" {
@@ -2562,10 +2558,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const owner = this.ctx.props.owner;
     const repo = this.ctx.props.repo;
     const searchQuery = buildIssueSearchQuery(owner, repo, query);
+    const assertSearchScope = (results: readonly Pick<GitHubIssueResponse, "html_url">[]) => {
+      try {
+        assertIssueSearchResultsInRepo(owner, repo, results);
+      } catch (error) {
+        logger.warn("GitHub issue search scope validation failed", {
+          event: "issue.search.scope.validation.failed", error,
+        });
+        throw error;
+      }
+    };
     return new StreamingCursor<GitHubIssueSummary>({
       fetchPage: async (page, perPage) => {
-        const cacheKey = this.#cacheKey("search-issues", stableKey(query), `p${page}`);
-        return await this.#loadCachedWithEtag<GitHubIssueSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
+        const cacheKey = this.#cacheKey("search-issues-scoped-v1", stableKey(query), `p${page}`);
+        const results = await this.#loadCachedWithEtag<CachedIssueSearchResult[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api =>
             api.searchIssuesConditional(searchQuery, page, perPage, remoteSort, remoteDirection, { ifNoneMatch: etag })
           );
@@ -2573,17 +2579,21 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             return raw;
           }
 
+          assertSearchScope(raw.data.items);
           return {
             status: 200,
             headers: raw.headers,
-            data: raw.data.items
-              .filter(item => !item.pull_request)
-              .map(item => normalizeIssueSummary(owner, repo, item)),
+            data: raw.data.items.map(item => ({
+              html_url: item.html_url,
+              summary: normalizeIssueSummary(owner, repo, item),
+            })),
           };
         });
+        assertSearchScope(results);
+        return results.map(item => item.summary);
       },
       overlay: item => this.#overlayIssueLike(item, "issue", item.id),
-      filter: () => true,  // Remote search results are already filtered by GitHub's search API.
+      filter: () => true,  // Search scope was validated before results entered the cursor.
       comparator: compare,
       injectedItems: provisionals,
       pageSize,

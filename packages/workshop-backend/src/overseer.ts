@@ -37,7 +37,7 @@ import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
-import { createWorkshopLogger, obsContext } from "./observability";
+import { createWorkshopLogger, obsContext, traced } from "./observability";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import {
   assertChatAttachmentSupportedByProvider,
@@ -934,7 +934,7 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
 type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
 
 // Don't build a snapshot until we have at least 64k of logs since the last one.
-const MIN_SNAPSHOT_THRESHOLD: number = 256; //65536;
+const MIN_SNAPSHOT_THRESHOLD: number = 65536;
 
 // Common internals that several interfaces implemented by the Overseer need to use. Can't just
 // declare private methods because some of the methods are needed by multiple classes.
@@ -1376,6 +1376,7 @@ class OverseerImpl implements AgentHooks {
 
     // Run the whole migration in one transaction so that a mid-migration error can't leave the
     // workspace half-migrated.
+    let startedAt = Date.now();
     this.ctx.storage.transactionSync(() => {
       // Version 0 -> 1: the workspace predates multi-gadget support. If it has any gadget content
       // (code beyond the initial empty snapshot, or named bindings), register that content as the
@@ -1454,6 +1455,10 @@ class OverseerImpl implements AgentHooks {
       }
 
       this.storage.version.put(1);
+    });
+
+    this.logger.info("migrated workspace storage", {
+      event: "storage.migration.completed", durationMs: Date.now() - startedAt,
     });
   }
 
@@ -2003,18 +2008,24 @@ class OverseerImpl implements AgentHooks {
       this.#snapshotMetrics.logSize += update.length;
       if (this.#snapshotMetrics.logSize >
           Math.max(this.#snapshotMetrics.snapshotSize, MIN_SNAPSHOT_THRESHOLD)) {
-        let {ydoc} = this.buildYDoc("current");
-        let snapshotUpdate = Y.encodeStateAsUpdateV2(ydoc);
-        this.storage.snapshots.put({
-          version,
-          timestamp,
-          update: snapshotUpdate
+        let logBytes = this.#snapshotMetrics.logSize;
+        let startedAt = Date.now();
+        traced("code.snapshot.rebuild", (span) => {
+          let {ydoc} = this.buildYDoc("current");
+          let snapshotUpdate = Y.encodeStateAsUpdateV2(ydoc);
+          this.storage.snapshots.put({version, timestamp, update: snapshotUpdate});
+          span.setAttribute("gadgetId", this.ctx.id.toString());
+          span.setAttribute("size", snapshotUpdate.length);
+          span.setAttribute("logBytes", logBytes);
+          this.#snapshotMetrics = {
+            snapshotSize: snapshotUpdate.length,
+            logSize: 0,
+          };
+          this.logger.info("rebuilt code snapshot", {
+            event: "code.snapshot.rebuilt", durationMs: Date.now() - startedAt,
+            size: snapshotUpdate.length, logBytes, sequence: version,
+          });
         });
-
-        this.#snapshotMetrics = {
-          snapshotSize: snapshotUpdate.length,
-          logSize: 0,
-        };
       }
     }
 
@@ -3857,8 +3868,8 @@ class OverseerImpl implements AgentHooks {
       gadgetId: this.ctx.id.toString(),
       chatId,
       modelId: aiModel.profile.id,
-    }, () => this.#runAgentTurnWithContext(
-        chatId, aiModel, initiator, callbackInitiated, liveChat));
+    }, () => traced("agent.run", () => this.#runAgentTurnWithContext(
+        chatId, aiModel, initiator, callbackInitiated, liveChat)));
   }
 
   async #runAgentTurnWithContext(chatId: number, aiModel: UserAiModelRecord,
@@ -7311,6 +7322,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!this.isOwner) {
       throw new Error("Only the workspace owner can delete it.");
     }
+    let startedAt = Date.now();
 
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_deleted",
@@ -7336,6 +7348,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       await this.impl.ctx.storage.deleteAll();
       this.impl.scheduleRevocationRestart();
       this.impl.ownerId = undefined;
+    });
+
+    this.impl.logger.info("deleted workspace", {
+      event: "workspace.delete.completed", durationMs: Date.now() - startedAt,
     });
   }
 
@@ -8390,6 +8406,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async deleteChat(chatId: number): Promise<void> {
+    let startedAt = Date.now();
     let response = this.impl.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
     if (response?.status === "waiting") {
       this.impl.deliverExternalMessageResponse(response, "The chat was deleted before the agent responded.");
@@ -8459,6 +8476,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Clean up all in-memory live state for this chat.
     this.impl.destroyLiveChat(chatId);
+
+    this.impl.logger.info("deleted chat", {
+      event: "chat.delete.completed", chatId, durationMs: Date.now() - startedAt,
+    });
   }
 
   async stopAgent(chatId: number): Promise<void> {

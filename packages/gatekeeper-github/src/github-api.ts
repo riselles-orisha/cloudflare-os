@@ -1,5 +1,3 @@
-import "cloudflare:workers";
-
 export type GitHubOAuthGrant = {
   accessToken: string;
   scopes: string[];
@@ -596,6 +594,7 @@ export class GitHubApi {
       "/search/issues",
       {
         q: query,
+        advanced_search: true,
         page,
         per_page: perPage,
         sort,
