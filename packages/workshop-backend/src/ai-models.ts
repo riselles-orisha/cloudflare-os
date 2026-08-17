@@ -21,9 +21,11 @@ import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./a
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 
- // Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
- // exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
- // Inference is routed through the account's "default" AI Gateway.
+ /**
+  * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
+  * exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
+  * Inference is routed through the account's "default" AI Gateway.
+  */
  export interface UserGatewayRouting {
    accountId: string;
    apiKey: string;
@@ -58,10 +60,12 @@ type ModelRoutingOptions = {
  * handle-level knobs.
  */
 export type ModelStreamOptions = SimpleStreamOptions & {
-  // When false, suppress the handle's per-API thinking/reasoning defaults so the request runs
-  // without extended thinking (as far as the model allows). Used by completeText(): one-shot
-  // calls -- titles, binding names, compaction summaries, gadget model bindings -- should be
-  // quick, and none of them benefit from cross-step reasoning. Default: true.
+  /**
+   * When false, suppress the handle's per-API thinking/reasoning defaults so the request runs
+   * without extended thinking (as far as the model allows). Used by completeText(): one-shot
+   * calls -- titles, binding names, compaction summaries, gadget model bindings -- should be
+   * quick, and none of them benefit from cross-step reasoning. Default: true.
+   */
   thinking?: boolean;
 };
 
@@ -72,24 +76,30 @@ export type ModelStreamOptions = SimpleStreamOptions & {
  * failures; failures surface as a final AssistantMessage with stopReason "error"/"aborted".
  */
 export type ModelHandle = {
-  // pi model descriptor (plain data; pi dispatches purely on `model.api`).
+  /** pi model descriptor (plain data; pi dispatches purely on `model.api`). */
   model: Model<Api>;
 
-  // Streams a response. Merges the handle's routing/auth and per-API options into whatever
-  // per-call options the caller (e.g. the agent loop) passes. Assignable to pi-agent-core's
-  // StreamFn (the extra ModelStreamOptions knobs are optional).
+  /**
+   * Streams a response. Merges the handle's routing/auth and per-API options into whatever
+   * per-call options the caller (e.g. the agent loop) passes. Assignable to pi-agent-core's
+   * StreamFn (the extra ModelStreamOptions knobs are optional).
+   */
   stream: (model: Model<Api>, context: Context, options?: ModelStreamOptions)
       => AssistantMessageEventStream;
 
-  // Route for retrieving this model's AI Gateway logs for cost accounting. Absent when requests
-  // don't flow through an AI Gateway (direct provider access, direct Workers AI REST).
+  /**
+   * Route for retrieving this model's AI Gateway logs for cost accounting. Absent when requests
+   * don't flow through an AI Gateway (direct provider access, direct Workers AI REST).
+   */
   aiGatewayLogRoute?: AiGatewayLogRoute;
 
-  // Status and AI Gateway log id of the most recent HTTP response observed by `stream`. Reset at
-  // the start of every request and set from pi's onResponse callback (which fires only once a
-  // response arrives -- an SDK-level failure leaves this undefined), so consumers must read it
-  // right after the request they care about completes. Turns run requests sequentially, so this
-  // is safe.
+  /**
+   * Status and AI Gateway log id of the most recent HTTP response observed by `stream`. Reset at
+   * the start of every request and set from pi's onResponse callback (which fires only once a
+   * response arrives -- an SDK-level failure leaves this undefined), so consumers must read it
+   * right after the request they care about completes. Turns run requests sequentially, so this
+   * is safe.
+   */
   lastResponse?: { status: number; aiGatewayLogId?: string };
 };
 
@@ -567,6 +577,29 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           reasoning: true,
           input: ["text", "image"],
           cost: ZERO_COST,
+
+          // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
+          // disabling it only for certain hostnames which are known not to support it.
+          //
+          // In ollama, some models support it and some do not. Frustratingly, the ones that do not
+          // don't necessarily throw an error. They may just proceed without a system prompt. For
+          // example, when I tested Muse Glimmer the day after it was released, I found it
+          // understood what tool calls were available to it but didn't know any of the info in
+          // the system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
+          // prompt as secret, so refused to answer my questions about it directly. But I figured
+          // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
+          // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
+          // exactly the same setup does understand the "developer" role and works fine. Weird!
+          //
+          // Some users also filed issues about this because they were trying to use the ollama
+          // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
+          // is not the intended use case for the ollama provider -- we should add an explicit
+          // provider for this. The ollama provider could in the future switch to using the ollama
+          // native API rather than the OpenAI-compatible endpoint, which would break users using
+          // it in this way. That said, if this flag works as a temporary work-around for them
+          // util we add a real OpenAI provider option... great.
+          compat: catalog?.compat ?? {supportsDeveloperRole: false},
+
           ...window,
         },
         ...(config.apiToken === ""

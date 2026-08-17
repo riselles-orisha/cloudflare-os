@@ -38,6 +38,7 @@ import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } fro
 import { AutoApprovalDrainer } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext, traced } from "./observability";
+import { wrapDoStubForTelemetry } from "./do-telemetry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import {
   assertChatAttachmentSupportedByProvider,
@@ -50,12 +51,12 @@ const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 
 let CODE_MODE_HARNESS =
-`import { WorkerEntrypoint, restore, RpcStub, RpcTarget } from "cloudflare:workers";
+`import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
   verify() {}
-  async run(self, callbackResolvers) {
+  async run(self, callbackResolvers, restoreForger) {
     let env = this.env;
     if (callbackResolvers) {
       for (let [index, {resolve, reject}] of Object.entries(callbackResolvers)) {
@@ -66,7 +67,39 @@ export default class extends WorkerEntrypoint {
         };
       }
     }
+    if (restoreForger) {
+      // Graft the well-known \`restore\` symbol onto each service-binding stub in env, so the
+      // executed code can call \`env.SOME_GADGET[restore](params)\` to forge a persistent stub
+      // targeting that gadget's [restore]() method. The symbol property is defined per-instance
+      // (not on the shared prototype) so only this execution's own bindings offer it, and it is
+      // invisible to RPC serialization, so passing a binding over RPC is unaffected. The
+      // capability itself is \`restoreForger\`, a transient stub scoped to this run() call; the
+      // overseer resolves the binding name back to the target gadget (and rejects non-gadget
+      // bindings with an instructive error).
+      for (let [name, value] of Object.entries(env)) {
+        if (value?.constructor?.name === "Fetcher") {
+          Object.defineProperty(value, restore, {
+            value: params => restoreForger.forge(name, params),
+          });
+        }
+      }
+    }
     await agent(self, env, this.ctx);
+  }
+}
+`;
+
+// A one-off dynamic worker whose only purpose is to call ctx.restore() while pretending to be a
+// particular gadget's facet. forgeRestoreStubForBinding() loads it through the overseer's own
+// ctx.restore() (see OverseerRestoreParams.codeId), so this worker's self-token names the target
+// gadget; the persistent stubs its forge() method creates therefore restore through that gadget's
+// [restore]() method.
+let RESTORE_FORGER_HARNESS =
+`import { WorkerEntrypoint, restore, RpcStub, RpcTarget } from "cloudflare:workers";
+
+export default class extends WorkerEntrypoint {
+  forge(params) {
+    return this.ctx.restore(params);
   }
 
   [restore](params) {
@@ -105,13 +138,60 @@ class PlaceholderRpcTarget extends RpcTarget {
 }
 `;
 
+let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
+  compatibilityDate: "2026-02-01",
+  compatibilityFlags: [
+    // The forger holds no bindings, but lock it down like the code-mode worker anyway.
+    "disallow_importable_env",
+
+    // Make ctx.restore() available.
+    "allow_irrevocable_stub_storage",
+  ],
+  mainModule: "forger.js",
+  modules: {
+    "forger.js": RESTORE_FORGER_HARNESS,
+  },
+  globalOutbound: null,
+};
+
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
   run(self?: unknown,
       callbackResolvers?: Record<string, {
         resolve: NativeRpcStub<(v: unknown) => void>,
         reject: NativeRpcStub<(e: unknown) => void>
-      }>): Promise<void>;
+      }>,
+      restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+}
+
+interface RestoreForgerEntrypoint extends WorkerEntrypoint {
+  forge(params: unknown): Promise<unknown>;
+}
+
+// The capability handed to CODE_MODE_HARNESS's run() that lets executed code invoke
+// `env.<name>[restore](params)`. Only executeCode receives this capability -- gadget workers
+// never do -- and it's passed as a transient stub argument to run(), so it lives exactly as
+// long as the execution. The binding name is resolved against the execution's own binding map
+// on the overseer side, so the capability conveys no authority beyond the env it accompanies.
+class RestoreForgerImpl extends NativeRpcTarget {
+  // Real private fields: RPC exposes an RpcTarget's properties as well as its methods, so
+  // TypeScript-only privacy would leak these to the executed code.
+  #impl: OverseerImpl;
+  #chatId: number;
+  #bindings: Record<string, ChatBindingEntry>;
+
+  constructor(impl: OverseerImpl, chatId: number,
+              bindings: Record<string, ChatBindingEntry>) {
+    super();
+    this.#impl = impl;
+    this.#chatId = chatId;
+    this.#bindings = bindings;
+  }
+
+  forge(bindingName: string, params: unknown): Promise<unknown> {
+    return this.#impl.forgeRestoreStubForBinding(
+        this.#chatId, this.#bindings, bindingName, params);
+  }
 }
 
 // =======================================================================================
@@ -430,8 +510,10 @@ export type ActionRecord = {
   createdAt: Date;
   state: ActionState;
 
-  // OBSOLETE: May still be present in records written when there was only one gadget per
-  // workspace. Ignore; use `resourceTitle` for display instead.
+  /**
+   * OBSOLETE: May still be present in records written when there was only one gadget per
+   * workspace. Ignore; use `resourceTitle` for display instead.
+   */
   bindingName?: string;
 } & ({
   type: "action";
@@ -446,17 +528,19 @@ export type ActionRecord = {
 } | {
   type: "bindHook";
 
-  // Denormalized so that the log is coherent even after the hook itself has been deleted.
+  /** Denormalized so that the log is coherent even after the hook itself has been deleted. */
   description: HookDescription;
 
-  // Binding a hook is treated as an action in the log for the purpose of logging that the hook
-  // was created, but hooks are also independently long-lived entities that live in their own
-  // table. `hookId` is a reference into the bound hooks table.
-  //
-  // This becomes `undefined` if the hook was later deleted.
+  /**
+   * Binding a hook is treated as an action in the log for the purpose of logging that the hook
+   * was created, but hooks are also independently long-lived entities that live in their own
+   * table. `hookId` is a reference into the bound hooks table.
+   *
+   * This becomes `undefined` if the hook was later deleted.
+   */
   hookId?: number;
 
-  // Denormalized for display purposes.
+  /** Denormalized for display purposes. */
   enabled: boolean;
 });
 
@@ -485,14 +569,18 @@ type ChatDraftUpdateRecord = {
   update: Uint8Array;
 };
 
-// A user opt-in to auto-approve actions carrying a given `actionKind` on a given gatekeeper
+/** A user opt-in to auto-approve actions carrying a given `actionKind` on a given gatekeeper */
 export type AutoApproveTagRecord = {
   gatekeeperId: WorkpieceId;
-  // The action kind (stable tag + display label, from ActionDescription.actionKind), captured when
-  // the rule was enabled so the rule can be listed without showing the raw machine tag.
+  /**
+   * The action kind (stable tag + display label, from ActionDescription.actionKind), captured when
+   * the rule was enabled so the rule can be listed without showing the raw machine tag.
+   */
   actionKind: ActionKind;
-  // Who turned this rule on. Auto-approvals run under this user's authority, so each auto-applied
-  // action is attributed to them in the audit log.
+  /**
+   * Who turned this rule on. Auto-approvals run under this user's authority, so each auto-applied
+   * action is attributed to them in the audit log.
+   */
   enabledBy: AiChatAuthorInfo;
 };
 
@@ -949,8 +1037,10 @@ const LISTING_REFRESH_BATCH = 16;
 // Longest noun accepted on a format reference. Denormalized display data.
 const MAX_FORMAT_REF_NOUN = 128;
 
-// Keeps `commandPosition` only if it's a real index into `args`. Anything else becomes undefined,
-// and the command renders at the front. Display-only, so a bad value isn't worth an error.
+/**
+ * Keeps `commandPosition` only if it's a real index into `args`. Anything else becomes undefined,
+ * and the command renders at the front. Display-only, so a bad value isn't worth an error.
+ */
 export function sanitizeCommandPosition(request: SlashCommandRequest): number | undefined {
   let position = request.commandPosition;
   if (position === undefined) return undefined;
@@ -960,9 +1050,11 @@ export function sanitizeCommandPosition(request: SlashCommandRequest): number | 
   return position;
 }
 
-// Drops format refs the message text doesn't back up. They're display-only and come from the
-// browser, so a bad one costs a chip, not the message. But a chip *replaces* the text it covers,
-// so a ref must cover exactly the noun it names -- or it could hide what the user really wrote.
+/**
+ * Drops format refs the message text doesn't back up. They're display-only and come from the
+ * browser, so a bad one costs a chip, not the message. But a chip *replaces* the text it covers,
+ * so a ref must cover exactly the noun it names -- or it could hide what the user really wrote.
+ */
 export function sanitizeMessageFormatRefs(
     refs: MessageFormatRef[] | undefined, message: string | undefined)
     : MessageFormatRef[] | undefined {
@@ -1687,14 +1779,11 @@ class OverseerImpl implements AgentHooks {
     });
   }
 
-  // Which gadget do persistent stubs sealed inside executeCode restore to? Letting executed code
-  // choose an owner per callback is a follow-up change; for now restore targets the workspace's
-  // first gadget: the default gadget when it exists, else the lowest-numbered gadget (including a
-  // provisional one — hooks recorded against it are torn down by removeGadget() if the provisional
-  // gadget is later rejected), else undefined (in which case restoration of such a stub fails with
-  // an explicit error).
-  // TODO(multi-gadget): Figure out how to allow ctx.restore() to work with multiple gadgets; may
-  // require runtime changes.
+  // Fallback bookkeeping target for hooks bound from executeCode when we can't tell which gadget
+  // the callback stub restores to (see bindHook): the workspace's first gadget, i.e. the default
+  // gadget when it exists, else the lowest-numbered gadget (including a provisional one — hooks
+  // recorded against it are torn down by removeGadget() if the provisional gadget is later
+  // rejected), else undefined.
   executeCodeRestoreTarget(): WorkpieceId | undefined {
     let def = this.defaultGadgetId;
     if (def !== undefined && this.storage.gadgets.get(def) !== undefined) return def;
@@ -2926,11 +3015,19 @@ class OverseerImpl implements AgentHooks {
     let enabled = false;
 
     // Which gadget does this hook wake (for bookkeeping; the callback itself already
-    // encapsulates the correct restore target)? A gadget caller names itself; hooks bound from
-    // executeCode restore to the workspace's first gadget for now, so record the same target.
-    let gadgetId = caller.from === "gadget" && caller.gadgetId !== undefined
-        ? caller.gadgetId
-        : this.executeCodeRestoreTarget();
+    // encapsulates the correct restore target)? A gadget caller names itself. An agent caller
+    // forged the callback via `env.<GADGET>[restore]` during the currently-running executeCode
+    // invocation, so when exactly one gadget had a stub forged there, attribute the hook to it;
+    // otherwise (or for other callers) fall back to the workspace's first gadget.
+    // TODO: Replace this heuristic with introspection of the callback stub's actual restore
+    //   target once the runtime offers an API for that.
+    let gadgetId: WorkpieceId | undefined;
+    if (caller.from === "gadget" && caller.gadgetId !== undefined) {
+      gadgetId = caller.gadgetId;
+    } else {
+      gadgetId = (caller.from === "agent" ? this.#soleForgedRestoreTarget(caller.chatId) : undefined)
+          ?? this.executeCodeRestoreTarget();
+    }
 
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
 
@@ -5422,30 +5519,7 @@ class OverseerImpl implements AgentHooks {
         globalOutbound: null,
       };
 
-      let entrypoint: Fetcher<CodeModeEntrypoint>;
-      let restoreGadgetId = this.executeCodeRestoreTarget();
-      if (restoreGadgetId === undefined) {
-        // With no gadget to own persistent callbacks, load the worker directly. ctx.restore()
-        // inside it will fail immediately rather than producing a stub that cannot restore later.
-        entrypoint = this.env.LOADER.load(workerDef).getEntrypoint<CodeModeEntrypoint>();
-      } else {
-        // Wacky hack: Load the code mode dynamic worker through `ctx.restore()`, so that it gets
-        // imbued with a self-token encoding its restore params as `{ type: "gadget", codeId }`.
-        // However, as soon as we remove `codeId` from the table, these params will redirect to
-        // point at the gadget instead. Hence, ctx.restore() inside the code mode worker will
-        // actually create RpcStubs that point at the gadget's `[restore]()` method. Whoa!
-        let codeId = crypto.randomUUID();
-        try {
-          this.#codeIdMap.set(codeId, workerDef);
-          entrypoint = await this.ctx.restore({
-            type: "gadget",
-            gadgetId: restoreGadgetId,
-            codeId,
-          });
-        } finally {
-          this.#codeIdMap.delete(codeId);
-        }
-      }
+      let entrypoint = this.env.LOADER.load(workerDef).getEntrypoint<CodeModeEntrypoint>();
 
       // First check the code actually starts up. Treat startup errors as total failures.
       await entrypoint.verify();
@@ -5481,7 +5555,10 @@ class OverseerImpl implements AgentHooks {
 
       let error: string | undefined;
       try {
-        await entrypoint.run(selfStub, callbackResolvers);
+        // The forger is a transient stub argument, so the capability to forge persistent
+        // gadget-restore stubs lives exactly as long as this run() call.
+        await entrypoint.run(selfStub, callbackResolvers,
+            new RestoreForgerImpl(this, chatId, bindings));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -5514,6 +5591,7 @@ class OverseerImpl implements AgentHooks {
     } finally {
       this.#codeModeOutputSubscribers.delete(executionId);
       this.#codeModeResolvers.delete(executionId);
+      this.#forgedRestoreTargets.delete(chatId);
     }
   }
 
@@ -6258,15 +6336,73 @@ class OverseerImpl implements AgentHooks {
 
   #codeIdMap = new Map<string, WorkerLoaderWorkerCode>;
 
-  restore(params: OverseerRestoreParams): Fetcher<DurableObject> | Fetcher<CodeModeEntrypoint> {
+  // Gadgets that had persistent restore stubs forged during each chat's currently-running
+  // executeCode invocation. Used only for bindHook()'s best-effort bookkeeping (see there);
+  // cleared when the invocation finishes. A forged stub can't outlive its execution without
+  // being bound, and executions within a chat are serialized, so execution scope suffices.
+  #forgedRestoreTargets = new Map<number, Set<WorkpieceId>>();
+
+  // Forge a persistent stub that restores through the gadget's [restore](params) method. The
+  // executeCode harness routes `env.<bindingName>[restore](params)` here (via RestoreForgerImpl);
+  // `bindings` is that execution's own binding map, so the name conveys exactly the env the
+  // executed code already holds.
+  async forgeRestoreStubForBinding(
+      chatId: number, bindings: Record<string, ChatBindingEntry>,
+      bindingName: string, params: unknown): Promise<unknown> {
+    let entry = bindings[bindingName];
+    if (!entry) {
+      throw new Error(`No such binding: ${bindingName}`);
+    }
+    if (entry.type !== "workpiece" || !this.storage.gadgets.get(entry.id)) {
+      throw new Error(
+          `[restore] is only available on Gadget bindings; "${bindingName}" is not a Gadget.`);
+    }
+    let gadgetId = entry.id;
+
+    // Wacky hack: Load the one-off "forger" worker through `ctx.restore()`, so that it gets
+    // imbued with a self-token encoding its restore params as `{ type: "gadget", gadgetId,
+    // codeId }`. However, as soon as we remove `codeId` from the table, these params will
+    // redirect to point at the gadget instead. Hence, ctx.restore() inside the forger worker
+    // actually creates RpcStubs that point at the gadget's `[restore]()` method. Whoa!
+    let codeId = crypto.randomUUID();
+    let forger: Fetcher<RestoreForgerEntrypoint>;
+    try {
+      this.#codeIdMap.set(codeId, RESTORE_FORGER_WORKER);
+      forger = await this.ctx.restore({type: "gadget", gadgetId, codeId});
+    } finally {
+      this.#codeIdMap.delete(codeId);
+    }
+
+    let stub = await forger.forge(params);
+
+    let targets = this.#forgedRestoreTargets.get(chatId);
+    if (!targets) {
+      targets = new Set();
+      this.#forgedRestoreTargets.set(chatId, targets);
+    }
+    targets.add(gadgetId);
+
+    return stub;
+  }
+
+  // If exactly one gadget has had a restore stub forged in the chat's current executeCode
+  // invocation, return it. Used by bindHook() to attribute the hook to the gadget its callback
+  // (probably) restores to.
+  #soleForgedRestoreTarget(chatId: number): WorkpieceId | undefined {
+    let targets = this.#forgedRestoreTargets.get(chatId);
+    return targets?.size === 1 ? targets.values().next().value : undefined;
+  }
+
+  restore(params: OverseerRestoreParams): Fetcher<DurableObject> | Fetcher<RestoreForgerEntrypoint> {
     if (params.type !== "gadget") {
       throw new TypeError("Unknown restore params type: " + params.type);
     }
 
     if (params.codeId) {
+      // The forger worker being loaded through ctx.restore() by forgeRestoreStubForBinding().
       let code = this.#codeIdMap.get(params.codeId);
       if (code) {
-        return this.env.LOADER.load(code).getEntrypoint<CodeModeEntrypoint>();
+        return this.env.LOADER.load(code).getEntrypoint<RestoreForgerEntrypoint>();
       }
     }
 
@@ -6287,14 +6423,15 @@ type OverseerRestoreParams = {
   // gadget (or the default gadget was deleted), restoration fails with an explicit error.
   gadgetId?: WorkpieceId;
 
-  // A hack: If present, and if the executeCode injection table currently contains this ID, then
+  // A hack: If present, and if the code injection table currently contains this ID, then
   // instead of returning the gadget stub, [restore]() loads a dynamic worker.
   //
-  // This is a super-tricky hack: When an executeCode tool call runs, we load the dynamic worker
-  // by putting the code we want into the code table under `codeId`, then calling ctx.restore()
-  // with `codeId`, then clearing the ID from the code table. This gets us a stub pointing at the
-  // code mode dynamic worker, but if that worker itself invokes ctx.restore(), it will actually
-  // have the effect of creating an RPC stub that restores from the gadget's [restore]() method.
+  // This is a super-tricky hack used by forgeRestoreStubForBinding(): to forge a persistent stub
+  // targeting a gadget's [restore]() method, we put the tiny "forger" worker's code into the
+  // table under `codeId`, call ctx.restore() with `codeId` (loading the forger), then clear the
+  // ID from the table. When the forger then calls ctx.restore(P) on our behalf, the resulting
+  // stub is persisted with these params as its self-token -- which, `codeId` no longer matching,
+  // now restores through the gadget's [restore]() method.
   codeId?: string;
 };
 
@@ -6306,15 +6443,17 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     this.impl = new OverseerImpl(ctx, env);
   }
 
-  // The alarm handler kicks in when we've had running agents that haven't completed for at least a
-  // minute. This serves a few purposes:
-  // - If the DO is still running when this is called, but the client has closed their browser and
-  //   so isn't holding the DO alive anymore, the alarm handler will take over and hold the DO
-  //   open until it's done.
-  // - If the DO somehow died since the agents were scheduled, the alarm will wake it up (and the
-  //   DO constructor will have rescheduled the agents, before alarm() itself runs).
-  // - If the DO dies *while* the alarm is running, the system will retry the alarm, thus resuming
-  //   the agents yet again.
+  /**
+   * The alarm handler kicks in when we've had running agents that haven't completed for at least a
+   * minute. This serves a few purposes:
+   * - If the DO is still running when this is called, but the client has closed their browser and
+   *   so isn't holding the DO alive anymore, the alarm handler will take over and hold the DO
+   *   open until it's done.
+   * - If the DO somehow died since the agents were scheduled, the alarm will wake it up (and the
+   *   DO constructor will have rescheduled the agents, before alarm() itself runs).
+   * - If the DO dies *while* the alarm is running, the system will retry the alarm, thus resuming
+   *   the agents yet again.
+   */
   async alarm() {
     await this.impl.waitForAllAgentsToComplete();
     await this.impl.deliverReadyExternalMessageResponses();
@@ -6337,16 +6476,20 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     this.impl.storage.version.put(1);
   }
 
-  // This workspace's outputs, for the owner to fold into their index. Every registry change and
-  // every owner open already pushes, so this exists only to catch up workspaces that predate the
-  // index. Null unless the caller really is the owner, so nobody else can read the snapshot.
+  /**
+   * This workspace's outputs, for the owner to fold into their index. Every registry change and
+   * every owner open already pushes, so this exists only to catch up workspaces that predate the
+   * index. Null unless the caller really is the owner, so nobody else can read the snapshot.
+   */
   async getOutputsForOwnerBackfill(ownerId: string): Promise<WorkspaceOutputEntry[] | null> {
     if (this.impl.ownerId !== ownerId) return null;
     return this.impl.outputsSnapshot();
   }
 
-  // `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
-  // by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
+  /**
+   * `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
+   * by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
+   */
   async open(userId: string, profileId: string,
              notifyClosed: NativeRpcStub<() => void>,
              shareKey?: string,
@@ -6479,11 +6622,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
-          this.impl, owner, clientUser, profileId, userId, notifyClosed.dup());
+          this.impl, profileId, userId, notifyClosed.dup());
     }
 
     return new OverseerClientInterface(
-        this.impl, owner, clientUser, profileId, userId, isOwner, notifyClosed.dup(),
+        this.impl, profileId, userId, isOwner, notifyClosed.dup(),
         ensureCapsules);
   }
 
@@ -6612,8 +6755,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return { accepted: true, chatPath: `/workspace/${this.ctx.id.toString()}?chat=${chatId}` };
   }
 
-  // Initialize this workspace's default gadget from a blueprint's code snapshot. Called by
-  // AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening) the DO.
+  /**
+   * Initialize this workspace's default gadget from a blueprint's code snapshot. Called by
+   * AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening) the DO.
+   */
   async initializeFromBlueprint(code: Uint8Array, title: string, output?: BlueprintOutput)
       : Promise<void> {
     // Set the title. The default gadget (created just below) inherits it.
@@ -6706,7 +6851,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.deliverCodeModeText(executionId, delta);
   }
 
-  // Called by AgentSelfLoopback when any method is called on the `self` object.
+  /** Called by AgentSelfLoopback when any method is called on the `self` object. */
   deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
       initiatorUserId: string, initiatorModelId: string): Promise<unknown> {
@@ -6714,7 +6859,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         chatId, methodName, args, initiatorUserId, initiatorModelId);
   }
 
-  // Called by TransientStubLoopback to retrieve a live transient RPC stub.
+  /** Called by TransientStubLoopback to retrieve a live transient RPC stub. */
   getTransientStub(chatId: number, sequence: number, stubIndex: number): any {
     // TODO: The workaround of wrapping in NativeRpcStub is needed because the runtime
     //   doesn't pipeline through Proxy objects properly. But here we're returning an
@@ -6837,14 +6982,16 @@ type BindingLoopbackTarget = {
   id: WorkpieceId;
 };
 
-// Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
-// contain RpcStubs. But if we ask the gatekeeper to open a session, we get an RpcStub. So we
-// actually initialize each binding to be a `ServiceStub` pointing at a `GatekeeperLoopback` whose
-// props identify the overseer and target workpiece, so that on each method call it can resolve the
-// target session.
-//
-// TODO(multi-gadget): Rename to BindingLoopback. Stubs to this entrypoint aren't stored anywhere,
-// so a rename should be safe.
+/**
+ * Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
+ * contain RpcStubs. But if we ask the gatekeeper to open a session, we get an RpcStub. So we
+ * actually initialize each binding to be a `ServiceStub` pointing at a `GatekeeperLoopback` whose
+ * props identify the overseer and target workpiece, so that on each method call it can resolve the
+ * target session.
+ *
+ * TODO(multi-gadget): Rename to BindingLoopback. Stubs to this entrypoint aren't stored anywhere,
+ * so a rename should be safe.
+ */
 export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, GatekeeperLoopbackProps> {
   constructor(ctx: ExecutionContext<GatekeeperLoopbackProps>, env: Cloudflare.Env) {
     super(ctx, env);
@@ -6869,8 +7016,10 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
     });
   }
 
-  // We need to declare a method otherwise the validator won't even report this class as existing
-  // and so the loopback binding won't be created.
+  /**
+   * We need to declare a method otherwise the validator won't even report this class as existing
+   * and so the loopback binding won't be created.
+   */
   dummyMethodToWorkAroundValidatorBug() {}
 }
 
@@ -6879,10 +7028,12 @@ type GatekeeperHookLoopbackProps = {
   hookId: number;
 };
 
-// When a gatekeeper's hook is connected, it receives a Fetcher to this class, which implements
-// the HookInitiator interface. When the gatekeeper wants to invoke the hook, it calls
-// startHook(), which returns both the actual hook RpcStub and an ApprovalQueue for logging
-// observations and actions.
+/**
+ * When a gatekeeper's hook is connected, it receives a Fetcher to this class, which implements
+ * the HookInitiator interface. When the gatekeeper wants to invoke the hook, it calls
+ * startHook(), which returns both the actual hook RpcStub and an ApprovalQueue for logging
+ * observations and actions.
+ */
 export class GatekeeperHookLoopback
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperHookLoopbackProps>
     implements HookInitiator<RpcTarget> {
@@ -6905,13 +7056,15 @@ type AgentSelfLoopbackProps = {
   initiatorModelId: string;
 };
 
-// The `self` magic object passed to code executed via the agent's `executeCode` tool.
-// Calling any method on it (e.g., self.foo(123)) delivers a callback message to the chat
-// thread and activates the agent to respond. This is a WorkerEntrypoint so it produces a
-// Fetcher that can be passed over RPC and stored in Durable Object KV storage.
-// TODO: Would be awesome if the agent could pass a sub-object like `self.foo`, and then be told
-//   later e.g. "foo.callback() was called". This requires that we implement RpcPromise
-//   serializability in the built-in RPC system, matching Cap'n Web.
+/**
+ * The `self` magic object passed to code executed via the agent's `executeCode` tool.
+ * Calling any method on it (e.g., self.foo(123)) delivers a callback message to the chat
+ * thread and activates the agent to respond. This is a WorkerEntrypoint so it produces a
+ * Fetcher that can be passed over RPC and stored in Durable Object KV storage.
+ * TODO: Would be awesome if the agent could pass a sub-object like `self.foo`, and then be told
+ *   later e.g. "foo.callback() was called". This requires that we implement RpcPromise
+ *   serializability in the built-in RPC system, matching Cap'n Web.
+ */
 export class AgentSelfLoopback
     extends WorkerEntrypoint<Cloudflare.Env, AgentSelfLoopbackProps> {
   constructor(ctx: ExecutionContext<AgentSelfLoopbackProps>, env: Cloudflare.Env) {
@@ -6936,8 +7089,10 @@ export class AgentSelfLoopback
     });
   }
 
-  // We need to declare a method otherwise the validator won't even report this class as existing
-  // and so the loopback binding won't be created.
+  /**
+   * We need to declare a method otherwise the validator won't even report this class as existing
+   * and so the loopback binding won't be created.
+   */
   dummyMethodToWorkAroundValidatorBug() {}
 }
 
@@ -6948,11 +7103,13 @@ type TransientStubLoopbackProps = {
   stubIndex: number;  // index into the transient stubs table for that message
 };
 
-// Loopback entrypoint that proxies to a transient RPC stub from a agent callback's arguments.
-// When the callback args are stored, each transient NativeRpcStub is replaced with one of
-// these. It forwards all method calls to the live stub (looked up from the Overseer's
-// in-memory table). If the stub has expired (the deliverAgentCallback RPC ended), calls will
-// throw.
+/**
+ * Loopback entrypoint that proxies to a transient RPC stub from a agent callback's arguments.
+ * When the callback args are stored, each transient NativeRpcStub is replaced with one of
+ * these. It forwards all method calls to the live stub (looked up from the Overseer's
+ * in-memory table). If the stub has expired (the deliverAgentCallback RPC ended), calls will
+ * throw.
+ */
 export class TransientStubLoopback
     extends WorkerEntrypoint<Cloudflare.Env, TransientStubLoopbackProps> {
   constructor(ctx: ExecutionContext<TransientStubLoopbackProps>, env: Cloudflare.Env) {
@@ -6974,8 +7131,10 @@ export class TransientStubLoopback
     });
   }
 
-  // We need to declare a method otherwise the validator won't even report this class as existing
-  // and so the loopback binding won't be created.
+  /**
+   * We need to declare a method otherwise the validator won't even report this class as existing
+   * and so the loopback binding won't be created.
+   */
   dummyMethodToWorkAroundValidatorBug() {}
 }
 
@@ -6996,8 +7155,10 @@ export class GadgetTailLoopback extends WorkerEntrypoint<Cloudflare.Env, GadgetT
     await stub.deliverGadgetLogs(this.ctx.props.chatId ?? null, logs);
   }
 
-  // New-style streaming tail worker. Delivers gadget console logs to the product UI in real time.
-  // Do not console.log the tail events here — they spam wrangler dev and are not ops logs.
+  /**
+   * New-style streaming tail worker. Delivers gadget console logs to the product UI in real time.
+   * Do not console.log the tail events here — they spam wrangler dev and are not ops logs.
+   */
   tailStream(event: TailStream.TailEvent<TailStream.Onset>)
       : TailStream.TailEventHandlerType | Promise<TailStream.TailEventHandlerType> {
     return {
@@ -7021,8 +7182,10 @@ export class GadgetTailLoopback extends WorkerEntrypoint<Cloudflare.Env, GadgetT
     };
   }
 
-  // Old-style tail worker. Logs are delayed until the end of the RPC event, which can be annoying
-  // for calls that do things like register subscriptions.
+  /**
+   * Old-style tail worker. Logs are delayed until the end of the RPC event, which can be annoying
+   * for calls that do things like register subscriptions.
+   */
   async tail(events: TraceItem[]) {
     if (events.length != 1) {
       logger.error("unexpected gadget trace size", {
@@ -7120,10 +7283,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   #clientProfilePromise: Promise<AiChatAuthorInfo> | undefined;
 
   constructor(private impl: OverseerImpl,
-              private owner: DurableObjectStub<UserDurableObject>,
-              private clientUser: DurableObjectStub<UserDurableObject>,
               private clientProfileId: string,
-              clientUserId: string,
+              private clientUserId: string,
               private isOwner: boolean,
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
@@ -7132,7 +7293,22 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     super();
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "build", () => this.#getClientProfile());
-    this.#leaveOutputsFanout = this.impl.joinOutputsFanout(clientUserId);
+    this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  // We create a new stub for every call so that we don't have to worry about detecting when a
+  // stub has become broken (see AuthenticatedApiImpl.#user in server.ts).
+  get #owner(): DurableObjectStub<UserDurableObject> {
+    if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)),
+        this.impl.logger);
+  }
+
+  get #clientUser(): DurableObjectStub<UserDurableObject> {
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
+        this.impl.logger);
   }
 
   #leavePresence: () => void;
@@ -7152,7 +7328,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async #getClientProfile(): Promise<AiChatAuthorInfo> {
     if (!this.#clientProfilePromise) {
-      this.#clientProfilePromise = this.clientUser.whoami().catch((err: unknown) => {
+      this.#clientProfilePromise = this.#clientUser.whoami().catch((err: unknown) => {
         this.#clientProfilePromise = undefined;
         throw err;
       });
@@ -7172,7 +7348,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       defaultGadgetId: this.impl.defaultGadgetId,
     };
     if (!this.isOwner) {
-      result.owner = await this.owner.whoami();
+      result.owner = await this.#owner.whoami();
     }
     return result;
   }
@@ -7193,7 +7369,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // For collaborators, include owner info.
     if (!this.isOwner) {
-      metadata.owner = await this.owner.whoami();
+      metadata.owner = await this.#owner.whoami();
     }
 
     let titleSubscriber = {
@@ -7243,11 +7419,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async setTitle(title: string): Promise<void> {
     this.impl.storage.title.put(title);
-    await this.owner.updateTitle(this.impl.ctx.id.toString(), title);
+    await this.#owner.updateTitle(this.impl.ctx.id.toString(), title);
   }
 
   async setPinned(pinned: boolean): Promise<void> {
-    await this.clientUser.updatePinned(this.impl.ctx.id.toString(), pinned);
+    await this.#clientUser.updatePinned(this.impl.ctx.id.toString(), pinned);
   }
 
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
@@ -7274,7 +7450,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       let taken = new Set(
           [...this.impl.storage.gadgets.list()].map(gadget => gadget.bindingName));
       for (let name of chatNames ?? []) taken.add(name);
-      let userMeta = await this.clientUser.getChatContext(null);
+      let userMeta = await this.#clientUser.getChatContext(null);
       if (userMeta.quickModel) {
         bindingName = await this.impl.generateBindingName(
             title, taken, {config: userMeta.quickModel, initiator: userMeta.profile});
@@ -7308,14 +7484,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUser);
+    return new GadgetClientImpl(this.impl, record.id, this.clientUserId);
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUser);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId);
   }
 
   async deleteSelf(): Promise<void> {
@@ -7326,7 +7502,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_deleted",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
     });
 
     this.impl.destroyAllLiveChats();
@@ -7344,7 +7520,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
-      await this.owner.deleteGadget(this.impl.ctx.id.toString());
+      await this.#owner.deleteGadget(this.impl.ctx.id.toString());
       await this.impl.ctx.storage.deleteAll();
       this.impl.scheduleRevocationRestart();
       this.impl.ownerId = undefined;
@@ -7453,7 +7629,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let gatekeeperId = await result.getId();
     this.impl.recordGadgetAnalytics({
       event_name: "connection_created",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
       gatekeeper_id: gatekeeperId,
       connection_type: connectionType,
       vendor_id: vendorId,
@@ -7463,7 +7639,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newGatekeeper(accountId: number, resourceUrl: string)
       : Promise<GatekeeperClient<any> | null> {
     let {class: cls, vendorId, typeUrlPattern} =
-        await this.clientUser.getGatekeeperClassFor(accountId, resourceUrl);
+        await this.#clientUser.getGatekeeperClassFor(accountId, resourceUrl);
     let creationSpec: GatekeeperCreationSpec = {
       type: "gatekeeper",
       vendorId,
@@ -7476,7 +7652,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>> {
-    let chatMeta = await this.clientUser.getChatContext(modelId);
+    let chatMeta = await this.#clientUser.getChatContext(modelId);
     let props: LanguageModelGatekeeperProps = {
       displayName: chatMeta.aiModel!.profile.name,
       config: chatMeta.aiModel!.config,
@@ -7523,7 +7699,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let props: AgentSpawnerBindingProps = {
       overseerId: this.impl.ctx.id.toString(),
       config,
-      creatorUserId: this.clientUser.id.toString(),
+      creatorUserId: this.#clientUser.id.toString(),
     };
 
     // Resolve model provider/name for blueprint metadata.
@@ -7532,7 +7708,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       config,
     };
     if (config.modelId) {
-      let chatMeta = await this.clientUser.getChatContext(config.modelId);
+      let chatMeta = await this.#clientUser.getChatContext(config.modelId);
       if (chatMeta.aiModel) {
         creationSpec.modelProvider = chatMeta.aiModel.config.provider;
         creationSpec.modelName = chatMeta.aiModel.config.model;
@@ -7840,7 +8016,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     }
 
-    let userMeta = await this.clientUser.getChatContext(modelId);
+    let userMeta = await this.#clientUser.getChatContext(modelId);
     if (!userMeta.aiModel) return;  // No model resolved; nothing to resume.
 
     let preparation = this.impl.waitForChatMessagePreparation(chatId);
@@ -7859,7 +8035,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.storage.chatMeta.put(fresh);
 
     this.impl.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                         this.clientUser.id.toString());
+                         this.#clientUser.id.toString());
   }
 
   async acceptConnectionRequest(
@@ -7957,7 +8133,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
-    return this.clientUser.listModels();
+    return this.#clientUser.listModels();
   }
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
@@ -7971,7 +8147,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   ): Promise<ChatAttachmentHandle> {
     let provider: AiModelConfig["provider"] | undefined;
     if (modelId !== null) {
-      provider = (await this.clientUser.getChatContext(modelId)).aiModel?.config.provider;
+      provider = (await this.#clientUser.getChatContext(modelId)).aiModel?.config.provider;
     }
     attachment = validateChatAttachmentUpload(
       attachment,
@@ -8195,8 +8371,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
                 formats?: MessageFormatRef[]): Promise<number> {
-    let userMeta = await this.clientUser.getChatContext(chosenModelId);
-    return this.impl.newChat(this.clientUser, userMeta, initialMessage, capsules, attachments,
+    let userMeta = await this.#clientUser.getChatContext(chosenModelId);
+    return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
                              undefined, undefined, formats);
   }
 
@@ -8204,9 +8380,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       chatId: number, message: string | SlashCommandRequest, chosenModelId: string | null,
       capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
       formats?: MessageFormatRef[]): Promise<void> {
-    let userMeta = await this.clientUser.getChatContext(chosenModelId);
+    let userMeta = await this.#clientUser.getChatContext(chosenModelId);
     return this.impl.sendChatMessage(
-        this.clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {
@@ -8221,7 +8397,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async mergeChanges(chatId: number, mergeThrough: number | null,
                      options?: { includeDraft?: boolean }): Promise<void> {
-    let userMeta = await this.clientUser.getChatContext(null);
+    let userMeta = await this.#clientUser.getChatContext(null);
 
     let meta = this.impl.assertChatNotActive(chatId);
     if (options?.includeDraft) {
@@ -8320,7 +8496,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
       chat_id: chatId,
       interaction_type: "code_merged",
     });
@@ -8487,7 +8663,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async retryAgent(chatId: number, modelId: string): Promise<void> {
-    let userMeta = await this.clientUser.getChatContext(modelId);
+    let userMeta = await this.#clientUser.getChatContext(modelId);
 
     let meta = this.impl.assertChatNotActive(chatId);
     if (!userMeta.aiModel) {
@@ -8502,7 +8678,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.storage.chatMeta.put(meta);
 
     this.impl.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                         this.clientUser.id.toString());
+                         this.#clientUser.id.toString());
   }
 
   async finalizeChatDraft(chatId: number): Promise<void> {
@@ -8740,7 +8916,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         // Check if the creator is the owner (requires an RPC to the owner's DO).
         let ownerProfileId = await this.impl.getOwnerProfileId();
         if (ownerProfileId === record.createdBy) {
-          createdBy = await this.owner.whoami();
+          createdBy = await this.#owner.whoami();
         }
         // Check if the creator is a collaborator (resolved locally).
         if (!createdBy) {
@@ -8787,15 +8963,27 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 @validateRpc()
 class UseOverseerInterface extends RpcTarget implements Overseer {
   constructor(private impl: OverseerImpl,
-              private owner: DurableObjectStub<UserDurableObject>,
-              private clientUser: DurableObjectStub<UserDurableObject>,
               private clientProfileId: string,
-              clientUserId: string,
+              private clientUserId: string,
               private notifyClosed: NativeRpcStub<() => void>) {
     super();
     this.#leavePresence = joinSessionPresence(
-        this.impl, this.clientProfileId, "use", () => this.clientUser.whoami());
-    this.#leaveOutputsFanout = this.impl.joinOutputsFanout(clientUserId);
+        this.impl, this.clientProfileId, "use", () => this.#clientUser.whoami());
+    this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  // Fresh stub per call; see OverseerClientInterface.#clientUser.
+  get #owner(): DurableObjectStub<UserDurableObject> {
+    if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)),
+        this.impl.logger);
+  }
+
+  get #clientUser(): DurableObjectStub<UserDurableObject> {
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
+        this.impl.logger);
   }
 
   #leavePresence: () => void;
@@ -8819,7 +9007,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     return {
       id: this.impl.ctx.id.toString(),
       title: this.impl.storage.title.get(),
-      owner: await this.owner.whoami(),
+      owner: await this.#owner.whoami(),
       role: "use",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
@@ -8833,7 +9021,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     let metadata: GadgetMetadata = {
       id: this.impl.ctx.id.toString(),
       title: this.impl.storage.title.get(),
-      owner: await this.owner.whoami(),
+      owner: await this.#owner.whoami(),
       role: "use",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
@@ -8881,7 +9069,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new UseGadgetClientInterface(this.impl, id, this.clientUser);
+    return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
   }
 
   // --- Denied methods (build-only) ---
@@ -9013,8 +9201,15 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 @validateRpc()
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUser: DurableObjectStub<UserDurableObject>) {
+      private clientUserId: string) {
     super();
+  }
+
+  // Fresh stub per call; see OverseerClientInterface.#clientUser.
+  get #clientUser(): DurableObjectStub<UserDurableObject> {
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
+        this.impl.logger);
   }
 
   async getId(): Promise<WorkpieceId> {
@@ -9065,7 +9260,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   async connectToGadget(chatId?: number): Promise<RpcStub<any>> {
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
       chat_id: chatId,
       interaction_type: "gadget_ui_connected",
     });
@@ -9073,7 +9268,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async exportPdf(chatId?: number): Promise<ReadableStream<Uint8Array>> {
-    let browser = this.impl.env.BROWSER;
+    // Read as possibly-undefined: self-hosted deployments may omit the binding (see env.d.ts).
+    let browser: BrowserRun | undefined = this.impl.env.BROWSER;
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle(chatId);
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");
@@ -9119,7 +9315,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     if (!this.impl.storage.chatMeta.get(chatId)) {
       throw new Error(`No such chat: ${chatId}`);
     }
-    let author = await this.clientUser.whoami();
+    let author = await this.#clientUser.whoami();
     this.impl.bindWorkpiece(this.id, name, target, chatId);
     this.impl.addChatMessages(chatId, author, [{
       type: "changes",
@@ -9252,7 +9448,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
     this.impl.recordGadgetAnalytics({
       event_name: "blueprint_created",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
       blueprint_id: id,
     });
 
@@ -9278,8 +9474,15 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 @validateRpc()
 class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUser: DurableObjectStub<UserDurableObject>) {
+      private clientUserId: string) {
     super();
+  }
+
+  // Fresh stub per call; see OverseerClientInterface.#clientUser.
+  get #clientUser(): DurableObjectStub<UserDurableObject> {
+    return wrapDoStubForTelemetry(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
+        this.impl.logger);
   }
 
   #deny(): never {
@@ -9313,7 +9516,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
-      user_id: this.clientUser.id.toString(),
+      user_id: this.#clientUser.id.toString(),
       interaction_type: "gadget_ui_connected",
     });
     return this.impl.getGadgetFacet(this.id, undefined);
@@ -9321,7 +9524,8 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async exportPdf(chatId?: number): Promise<ReadableStream<Uint8Array>> {
     if (chatId !== undefined) this.#deny();
-    let browser = this.impl.env.BROWSER;
+    // Read as possibly-undefined: self-hosted deployments may omit the binding (see env.d.ts).
+    let browser: BrowserRun | undefined = this.impl.env.BROWSER;
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle();
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");

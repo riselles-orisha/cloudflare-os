@@ -3,7 +3,7 @@ node_modules/
 
 # Build outputs
 dist/
-# Generated gatekeeper UI bundles, rebuilt as a prerequisite of build/types:check/deploy
+# Generated gatekeeper UI bundles, rebuilt as a prerequisite of build/deploy
 packages/gatekeeper-*/src/generated/*-configurator-ui.txt
 packages/gatekeeper-*/src/generated/*-configurator-ui.js*
 packages/gatekeeper-*/src/generated/app.txt
