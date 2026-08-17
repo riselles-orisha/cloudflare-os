@@ -423,8 +423,8 @@ function getModelViaGateway(
     Authorization: null,
     "x-api-key": null,
   };
-  const gatewayBase =
-      `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;
+  const gatewayBase = gwConfig.gatewayBaseUrl
+      ?? `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;
   const logRoute = (gateway: string): AiGatewayLogRoute =>
       ({ gateway, accountId: gwConfig.accountId, apiToken: gwConfig.apiToken });
 

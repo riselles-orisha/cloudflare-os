@@ -23,6 +23,10 @@ declare global {
       CF_AI_GATEWAY_WAI?: string;         // Optional Workers AI gateway override
       CF_AI_GATEWAY_WAI_DIRECT?: string;  // "true" to route Workers AI to its plain REST endpoint
                                           // (no gateway, no cost logs) instead of a named Gateway
+      CF_AI_GATEWAY_URL?: string;         // Optional full base URL override for the AI Gateway endpoint.
+                                          // When set, provider paths are appended to this URL directly,
+                                          // bypassing https://gateway.ai.cloudflare.com/v1/{acct}/{gw}.
+                                          // Example: "https://ai-gateway.example.dev"
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 

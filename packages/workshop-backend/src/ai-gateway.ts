@@ -13,6 +13,14 @@ export class AiGatewayConfig {
   readonly accountId: string;
   readonly apiToken: string;
   readonly providers: Set<string>;
+  /**
+   * Custom AI Gateway base URL. When set via `CF_AI_GATEWAY_URL`, provider-path suffixes
+   * (`/anthropic`, `/openai`, `/workers-ai/v1`, etc.) are appended to this URL directly,
+   * bypassing the default `https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}` scheme.
+   * Use this to route inference through a custom gateway endpoint (e.g. a branded proxy) for
+   * per-user usage tracking or access control.
+   */
+  readonly gatewayBaseUrl?: string;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -26,6 +34,7 @@ export class AiGatewayConfig {
     }
     this.accountId = env.CF_AI_GATEWAY_ACCOUNT_ID;
     this.apiToken = env.CF_AI_GATEWAY_API_TOKEN;
+    this.gatewayBaseUrl = env.CF_AI_GATEWAY_URL || undefined;
     if (env.CF_AI_GATEWAY_WAI_DIRECT === "true" && env.CF_AI_GATEWAY_WAI) {
       throw new Error(
           "CF_AI_GATEWAY_WAI and CF_AI_GATEWAY_WAI_DIRECT cannot be configured together.");
