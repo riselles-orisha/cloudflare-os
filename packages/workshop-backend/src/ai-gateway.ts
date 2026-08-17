@@ -21,6 +21,14 @@ export class AiGatewayConfig {
    * per-user usage tracking or access control.
    */
   readonly gatewayBaseUrl?: string;
+  /**
+   * Cloudflare Access service token credentials for the custom gateway URL. When
+   * `CF_AI_GATEWAY_ACCESS_CLIENT_ID` and `CF_AI_GATEWAY_ACCESS_CLIENT_SECRET` are set, the
+   * Worker attaches `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers on every request
+   * to the custom gateway, satisfying an Access policy that protects the endpoint. Only used
+   * when `gatewayBaseUrl` is also set; ignored on the default Cloudflare AI Gateway path.
+   */
+  readonly accessServiceToken?: { clientId: string; clientSecret: string };
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -35,6 +43,12 @@ export class AiGatewayConfig {
     this.accountId = env.CF_AI_GATEWAY_ACCOUNT_ID;
     this.apiToken = env.CF_AI_GATEWAY_API_TOKEN;
     this.gatewayBaseUrl = env.CF_AI_GATEWAY_URL || undefined;
+    if (env.CF_AI_GATEWAY_ACCESS_CLIENT_ID && env.CF_AI_GATEWAY_ACCESS_CLIENT_SECRET) {
+      this.accessServiceToken = {
+        clientId: env.CF_AI_GATEWAY_ACCESS_CLIENT_ID,
+        clientSecret: env.CF_AI_GATEWAY_ACCESS_CLIENT_SECRET,
+      };
+    }
     if (env.CF_AI_GATEWAY_WAI_DIRECT === "true" && env.CF_AI_GATEWAY_WAI) {
       throw new Error(
           "CF_AI_GATEWAY_WAI and CF_AI_GATEWAY_WAI_DIRECT cannot be configured together.");

@@ -27,6 +27,11 @@ declare global {
                                           // When set, provider paths are appended to this URL directly,
                                           // bypassing https://gateway.ai.cloudflare.com/v1/{acct}/{gw}.
                                           // Example: "https://ai-gateway.example.dev"
+      CF_AI_GATEWAY_ACCESS_CLIENT_ID?: string;     // Cloudflare Access service token Client ID.
+                                                   // Required when CF_AI_GATEWAY_URL points to an
+                                                   // Access-protected custom gateway endpoint.
+      CF_AI_GATEWAY_ACCESS_CLIENT_SECRET?: string; // Cloudflare Access service token Client Secret
+                                                   // paired with CF_AI_GATEWAY_ACCESS_CLIENT_ID.
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 

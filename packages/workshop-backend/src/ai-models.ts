@@ -425,7 +425,16 @@ function getModelViaGateway(
   options: ModelRoutingOptions,
 ): ModelHandle {
   const metadata = buildMetadata(initiator, options.metadata);
-  const gatewayAuthHeaders: ProviderHeaders = {
+  // When routing through a custom Access-protected gateway, authenticate with a Cloudflare Access
+  // service token instead of cf-aig-authorization. The Authorization and x-api-key headers are
+  // still suppressed so the gateway's own server-managed provider keys apply for inference.
+  const gatewayAuthHeaders: ProviderHeaders = gwConfig.accessServiceToken ? {
+    "CF-Access-Client-Id": gwConfig.accessServiceToken.clientId,
+    "CF-Access-Client-Secret": gwConfig.accessServiceToken.clientSecret,
+    "cf-aig-authorization": `Bearer ${gwConfig.apiToken}`,
+    Authorization: null,
+    "x-api-key": null,
+  } : {
     // pi's API impls explicitly recognize cf-aig-authorization and skip SDK auth; the null
     // values suppress the SDKs' own auth headers so the gateway's server-managed provider keys
     // apply.
@@ -438,8 +447,7 @@ function getModelViaGateway(
   const logRoute = (gateway: string): AiGatewayLogRoute =>
       ({ gateway, accountId: gwConfig.accountId, apiToken: gwConfig.apiToken });
 
-  if (config.provider === "cloudflare" && !gwConfig.workersAiGateway) {
-    // CF_AI_GATEWAY_WAI_DIRECT: the plain Workers AI REST endpoint -- no gateway, no log route,
+  if (config.provider === "cloudflare" && !gwConfig.workersAiGateway) {    // CF_AI_GATEWAY_WAI_DIRECT: the plain Workers AI REST endpoint -- no gateway, no log route,
     // no gateway metadata (mirroring the old direct-binding path, which had no
     // aiGatewayLogRoute). Reuses the CF_AI_GATEWAY_* account/token pair.
     const catalog = catalogModel(config.provider, config.model);
@@ -464,9 +472,15 @@ function getModelViaGateway(
 
   // Workers AI may be routed through a different gateway than the other providers
   // (CF_AI_GATEWAY_WAI); either way, gateway log route and attribution metadata apply.
+  // When a custom gatewayBaseUrl is set it already encodes the full gateway root (account +
+  // gateway name), so we append only the provider path. On the standard Cloudflare URL the
+  // gateway name is still part of the path and must be appended.
   const gateway = config.provider === "cloudflare"
       ? gwConfig.workersAiGateway! : gwConfig.gateway;
-  const model = gatewayNativeModel(config, `${gatewayBase}/${gateway}`);
+  const gatewayRoot = gwConfig.gatewayBaseUrl
+      ? gatewayBase
+      : `${gatewayBase}/${gateway}`;
+  const model = gatewayNativeModel(config, gatewayRoot);
   if (!model) {
     throw new Error(
       `Provider "${config.provider}" is not supported through AI Gateway. ` +
