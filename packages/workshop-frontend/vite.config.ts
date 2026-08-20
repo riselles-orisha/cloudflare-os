@@ -14,7 +14,7 @@ const ownDist = { pattern: '!dist/**', base: 'package' } as const
 const runConfig = {
   run: {
     tasks: {
-      'clean:dist': { command: 'rm -rf dist', cache: false },
+      'clean:dist': { command: 'rimraf dist', cache: false },
       /**
        * `build` is a task rather than a package.json script so `env` can declare the `VITE_*` flags
        * it reads: a cached `vp` run executes scripts in a clean environment, and the values would be
