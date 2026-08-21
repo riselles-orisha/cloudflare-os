@@ -1,8 +1,8 @@
 import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
-  AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, Model, ModelCost,
-  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
+  AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, FetchFunction, Model,
+  ModelCost, OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
 } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
@@ -21,15 +21,15 @@ import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./a
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 
- /**
-  * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
-  * exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
-  * Inference is routed through the account's "default" AI Gateway.
-  */
- export interface UserGatewayRouting {
-   accountId: string;
-   apiKey: string;
- }
+/**
+ * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
+ * exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
+ * Inference is routed through the account's "default" AI Gateway.
+ */
+export interface UserGatewayRouting {
+  accountId: string;
+  apiKey: string;
+}
 
 // Gadgets-owned attribution schema attached to AI Gateway requests.
 type GatewayMetadata = {
@@ -85,7 +85,7 @@ export type ModelHandle = {
    * StreamFn (the extra ModelStreamOptions knobs are optional).
    */
   stream: (model: Model<Api>, context: Context, options?: ModelStreamOptions)
-      => AssistantMessageEventStream;
+    => AssistantMessageEventStream;
 
   /**
    * Route for retrieving this model's AI Gateway logs for cost accounting. Absent when requests
@@ -144,13 +144,13 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
 // budgets in agent-compaction.ts are computed from it and must not change); pi's catalog fills
 // gaps for models we don't list, and unknown models get conservative defaults.
 function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined)
-    : { contextWindow: number, maxTokens: number } {
+  : { contextWindow: number, maxTokens: number } {
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
     contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
     maxTokens: suggested?.outputLimit ??
-        (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
-        catalog?.maxTokens ?? 4096,
+      (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
+      catalog?.maxTokens ?? 4096,
   };
 }
 
@@ -167,9 +167,11 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
 }
 
 // Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
-// (the platform's or a user's). `gatewayUrl` is a gateway root
-// (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}); each provider's native API is
-// exposed under a per-provider path on it. AI Gateway also offers a unified OpenAI-compat
+// (the platform's or a user's). `gatewayUrl` is a gateway root -- over HTTPS
+// (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}) or, for binding-routed requests,
+// over the AI binding (https://workers-binding.ai/ai-gateway/gateways/{gateway}); each
+// provider's native API is exposed under the same per-provider path on either. AI Gateway also
+// offers a unified OpenAI-compat
 // translation layer (/compat), which we deliberately never use: we already speak every
 // provider's native API, and the translation drops provider features pi relies on (extended
 // thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Billing --
@@ -273,6 +275,10 @@ type HandleArgs = {
   gatewayMetadata?: GatewayMetadata;
   sessionAffinity?: string;
   aiGatewayLogRoute?: AiGatewayLogRoute;
+  // Transport override for every request on this handle: how a binding-routed model reaches the
+  // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
+  // A per-call options.fetch still wins, which tests rely on to capture requests.
+  fetch?: FetchFunction;
 };
 
 function makeHandle(args: HandleArgs): ModelHandle {
@@ -294,8 +300,8 @@ function makeHandle(args: HandleArgs): ModelHandle {
   // - Everything else: provider defaults.
   const anthropicCompat = args.model.compat as AnthropicMessagesCompat | undefined;
   const apiExtras: Record<string, unknown> =
-      args.model.api === "anthropic-messages"
-          ? (anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {}) :
+    args.model.api === "anthropic-messages"
+      ? (anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {}) :
       args.model.api === "openai-responses" ? { reasoningEffort: "medium" } : {};
 
   const handle: ModelHandle = {
@@ -308,8 +314,8 @@ function makeHandle(args: HandleArgs): ModelHandle {
         ...args.headers,
         ...options.headers,
         ...(args.gatewayMetadata
-            ? { "cf-aig-metadata": JSON.stringify(args.gatewayMetadata) }
-            : {}),
+          ? { "cf-aig-metadata": JSON.stringify(args.gatewayMetadata) }
+          : {}),
       };
       const merged: SimpleStreamOptions = {
         // API defaults first, so an explicit per-call option can override them. `thinking: false`
@@ -318,8 +324,9 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // off, e.g. claude-fable-5); for OpenAI Responses, passing no reasoningEffort makes pi
         // disable reasoning.
         ...(thinking
-            ? apiExtras
-            : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
+          ? apiExtras
+          : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
+        ...(args.fetch !== undefined ? { fetch: args.fetch } : {}),
         ...options,
         ...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
@@ -338,9 +345,6 @@ function makeHandle(args: HandleArgs): ModelHandle {
           const replaced = await options.onPayload?.(payload, payloadModel);
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
-        // NOTE(binding-transport): pi passes `options.fetch` into its SDK clients on all paths.
-        // If Workers-binding-backed inference returns (upstream ask filed), inject a
-        // fetch-to-binding shim here and relax the token requirements in ai-gateway.ts.
       };
       return streamFn(model, context, merged);
     },
@@ -355,15 +359,15 @@ function makeHandle(args: HandleArgs): ModelHandle {
  * for cost accounting, when there is one.
  */
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
-                         initiator: AiChatAuthorInfo,
-                         options: ModelRoutingOptions = {}): ModelHandle {
+  initiator: AiChatAuthorInfo,
+  options: ModelRoutingOptions = {}): ModelHandle {
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
   if (options.userGateway) {
     return getModelViaUserGateway(
-        config, buildMetadata(initiator, options.metadata), options.userGateway,
-        options.sessionAffinity);
+      config, buildMetadata(initiator, options.metadata), options.userGateway,
+      options.sessionAffinity);
   }
 
   // Otherwise: when a platform AI Gateway is configured, route through it (platform-funded free
@@ -391,7 +395,7 @@ function getModelViaUserGateway(
   // account-level `/ai/v1` REST endpoint rejects that token. We always use the account's
   // auto-created "default" gateway.
   const model = gatewayNativeModel(
-      config, `https://gateway.ai.cloudflare.com/v1/${userGateway.accountId}/default`);
+    config, `https://gateway.ai.cloudflare.com/v1/${userGateway.accountId}/default`);
   if (!model) {
     throw new Error(`Provider "${config.provider}" is not supported via unified billing.`);
   }
@@ -416,6 +420,28 @@ function getModelViaUserGateway(
   });
 }
 
+/**
+ * Placeholder auth value for binding-routed requests. pi's API impls require an API key or a
+ * recognized auth header (authorization, x-api-key, cf-aig-authorization) before dispatch;
+ * binding calls are pre-authenticated in-account, so this satisfies the check and the gateway
+ * recognizes and strips it rather than treating it as a BYOK provider key.
+ */
+const CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL = "cloudflare-gateway-binding";
+
+/**
+ * `Ai#fetch` exists at runtime but @cloudflare/workers-types' `Ai` doesn't declare it, so the
+ * binding is cast structurally to reach the passthrough.
+ */
+type AiFetchBinding = {
+  fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
+};
+
+// pi drives the model's baseUrl, which already names the gateway route on the binding's host,
+// so the binding's fetch passes through unchanged -- no URL rewriting needed.
+function bindingFetch(binding: Ai): FetchFunction {
+  return (input, init) => (binding as unknown as AiFetchBinding).fetch(input, init);
+}
+
 // Platform free-tier path: route through the deployment's configured AI Gateway (platform-funded).
 // Used only for requests that are NOT billed to a connected user's account.
 function getModelViaGateway(
@@ -425,27 +451,33 @@ function getModelViaGateway(
   options: ModelRoutingOptions,
 ): ModelHandle {
   const metadata = buildMetadata(initiator, options.metadata);
-  // When routing through a custom Access-protected gateway, authenticate with a Cloudflare Access
-  // service token instead of cf-aig-authorization. The Authorization and x-api-key headers are
-  // still suppressed so the gateway's own server-managed provider keys apply for inference.
-  const gatewayAuthHeaders: ProviderHeaders = gwConfig.accessServiceToken ? {
-    "CF-Access-Client-Id": gwConfig.accessServiceToken.clientId,
-    "CF-Access-Client-Secret": gwConfig.accessServiceToken.clientSecret,
-    "cf-aig-authorization": `Bearer ${gwConfig.apiToken}`,
-    Authorization: null,
-    "x-api-key": null,
-  } : {
+  const binding = gwConfig.bindingFor(config.provider);
+  // No binding means either the provider can't ride one or the deployment has none; the second
+  // case already required a token in the constructor, so this only fires for the first
+  if (!binding && !gwConfig.apiToken) {
+    throw new Error(`Provider "${config.provider}" cannot use the Workers AI binding transport, ` +
+      "and no CF_AI_GATEWAY_API_TOKEN is configured for the HTTPS one.");
+  }
+  const gatewayAuthHeaders: ProviderHeaders = {
     // pi's API impls explicitly recognize cf-aig-authorization and skip SDK auth; the null
     // values suppress the SDKs' own auth headers so the gateway's server-managed provider keys
     // apply.
-    "cf-aig-authorization": `Bearer ${gwConfig.apiToken}`,
+    "cf-aig-authorization":
+      `Bearer ${binding ? CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL : gwConfig.apiToken}`,
     Authorization: null,
     "x-api-key": null,
+
+    ...(gwConfig.accessServiceToken ? {
+      "CF-Access-Client-Id": gwConfig.accessServiceToken.clientId,
+      "CF-Access-Client-Secret": gwConfig.accessServiceToken.clientSecret,
+    } : {}),
   };
+
   const gatewayBase = gwConfig.gatewayBaseUrl
-      ?? `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;
+    ?? `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}`;
+    
   const logRoute = (gateway: string): AiGatewayLogRoute =>
-      ({ gateway, accountId: gwConfig.accountId, apiToken: gwConfig.apiToken });
+    ({ gateway, accountId: gwConfig.accountId, apiToken: gwConfig.apiToken });
 
   if (config.provider === "cloudflare" && !gwConfig.workersAiGateway) {    // CF_AI_GATEWAY_WAI_DIRECT: the plain Workers AI REST endpoint -- no gateway, no log route,
     // no gateway metadata (mirroring the old direct-binding path, which had no
@@ -476,10 +508,10 @@ function getModelViaGateway(
   // gateway name), so we append only the provider path. On the standard Cloudflare URL the
   // gateway name is still part of the path and must be appended.
   const gateway = config.provider === "cloudflare"
-      ? gwConfig.workersAiGateway! : gwConfig.gateway;
+    ? gwConfig.workersAiGateway! : gwConfig.gateway;
   const gatewayRoot = gwConfig.gatewayBaseUrl
-      ? gatewayBase
-      : `${gatewayBase}/${gateway}`;
+    ? gatewayBase
+    : `${gatewayBase}/${gateway}`;
   const model = gatewayNativeModel(config, gatewayRoot);
   if (!model) {
     throw new Error(
@@ -498,6 +530,7 @@ function getModelViaGateway(
     // the gateway recognizes its own token there and applies the stored Google key instead.
     ...(config.provider === "google" ? { apiKey: gwConfig.apiToken } : {}),
     headers: gatewayAuthHeaders,
+    ...(binding ? { fetch: bindingFetch(binding) } : {}),
     gatewayMetadata: metadata,
     sessionAffinity: options.sessionAffinity,
     aiGatewayLogRoute: logRoute(gateway),
@@ -534,8 +567,8 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       // model config. (The REST endpoint is account-scoped, hence the extra accountId field.)
       if (!config.accountId || !config.apiToken) {
         throw new Error(
-            "This Workers AI model has no Cloudflare credentials. Re-add it with your " +
-            "Cloudflare account ID and an API token that permits Workers AI.");
+          "This Workers AI model has no Cloudflare credentials. Re-add it with your " +
+          "Cloudflare account ID and an API token that permits Workers AI.");
       }
       return makeHandle({
         model: {
@@ -587,7 +620,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           api: "openai-completions",
           provider: "ollama",
           baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
-              .replace(/\/(api|v1)$/, "")}/v1`,
+            .replace(/\/(api|v1)$/, "")}/v1`,
           reasoning: true,
           input: ["text", "image"],
           cost: ZERO_COST,
@@ -612,13 +645,13 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           // native API rather than the OpenAI-compatible endpoint, which would break users using
           // it in this way. That said, if this flag works as a temporary work-around for them
           // util we add a real OpenAI provider option... great.
-          compat: catalog?.compat ?? {supportsDeveloperRole: false},
+          compat: catalog?.compat ?? { supportsDeveloperRole: false },
 
           ...window,
         },
         ...(config.apiToken === ""
-            ? { apiKey: "unused", headers: { Authorization: null } }
-            : { apiKey: config.apiToken }),
+          ? { apiKey: "unused", headers: { Authorization: null } }
+          : { apiKey: config.apiToken }),
         sessionAffinity,
       });
     case "openai":
@@ -684,8 +717,8 @@ export type LanguageModelGatekeeperProps = {
 };
 
 export class LanguageModelGatekeeper
-    extends DurableObject<Cloudflare.Env, LanguageModelGatekeeperProps>
-    implements Gatekeeper<LanguageModelBinding> {
+  extends DurableObject<Cloudflare.Env, LanguageModelGatekeeperProps>
+  implements Gatekeeper<LanguageModelBinding> {
   async describe(): Promise<ResourceDescription> {
     let modelConfig = this.ctx.props.config;
     let displayName = this.ctx.props.displayName;
@@ -712,7 +745,7 @@ export class LanguageModelGatekeeper
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
-      : Promise<LanguageModelBinding> {
+    : Promise<LanguageModelBinding> {
     let model = getModel(this.env, this.ctx.props.config, this.ctx.props.initiator, {
       metadata: this.ctx.props.metadata,
     });
@@ -722,11 +755,11 @@ export class LanguageModelGatekeeper
   applyAction(action: number): Promise<void> {
     throw new Error("This gatekeeper implements no actions.");
   }
-  rejectAction(action: number): Promise<void | {restart?: boolean}> {
+  rejectAction(action: number): Promise<void | { restart?: boolean }> {
     throw new Error("This gatekeeper implements no actions.");
   }
   revertAction(action: number):
-      Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}> {
+    Promise<void | { message?: string, canRetry?: boolean, restart?: boolean }> {
     throw new Error("This gatekeeper implements no actions.");
   }
 
@@ -746,7 +779,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
     super();
   }
 
-  async run(options: {prompt: string, systemPrompt?: string}): Promise<string> {
+  async run(options: { prompt: string, systemPrompt?: string }): Promise<string> {
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
     // TODO: Account LLM costs back to the calling gadget.

@@ -12,6 +12,7 @@ import {
   McpCallNotDispatchedError,
   McpClient,
   McpSessionExpiredError,
+  type McpToolFilter,
   type ToolCatalog,
 }
   from "./client.js";
@@ -31,6 +32,8 @@ export type WithClientOptions = {
   // any retry. Prevents an unresponsive MCP endpoint from stalling the caller until the Workers
   // runtime kills the request with no explanation. Defaults to `DEFAULT_MCP_CALL_TIMEOUT_MS`.
   timeoutMs?: number;
+  /** Absolute deadline shared with time spent waiting for a discovery slot. */
+  deadline?: number;
 };
 
 // Default hard ceiling for a single `withClient` operation. Chosen below the Workers ~30s CPU/wall
@@ -120,7 +123,10 @@ export async function withClient<T>(
         await account.assertConnectionCurrent(endpoint, generation);
       }
       return authorization;
-    }, sessionId, fetchOptions(env));
+    }, sessionId, {
+      ...fetchOptions(env),
+      deadline: options.deadline,
+    });
   let persistedSessionId = sessionId;
 
   const persistSession = async (): Promise<void> => {
@@ -218,8 +224,12 @@ export async function withClient<T>(
  * listing short, since callers infer what the endpoint is from what it does and does not offer.
  */
 export async function fetchTools(
-  env: ConnectionEnv, account: ConnectionAccount, endpoint: string,
+  env: ConnectionEnv,
+  account: ConnectionAccount,
+  endpoint: string,
+  include?: McpToolFilter,
+  options?: WithClientOptions,
 ): Promise<ToolCatalog> {
   return withClient(env, account, endpoint,
-    client => client.listTools(MAX_TOOLS_PER_SERVER));
+    client => client.listTools(MAX_TOOLS_PER_SERVER, include), options);
 }
