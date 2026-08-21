@@ -9,7 +9,7 @@
     "build:app:watch": "node build-app.mjs --watch",
     "typecheck:app": "tsc -p tsconfig.app.json && tsc -p tsconfig.vite.json",
     "build": "pnpm run typecheck:app && vp run --cache build:app && tsc",
-    "clean": "rm -rf dist src/generated",
+    "clean": "rimraf dist src/generated",
     "test:run": "vitest run && vitest run -c vitest.node.config.ts"
   },
   "dependencies": {

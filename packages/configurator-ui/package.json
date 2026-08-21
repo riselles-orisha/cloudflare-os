@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "clean": "rm -rf dist",
+    "clean": "rimraf dist",
     "test:run": "vitest run --passWithNoTests"
   },
   "devDependencies": {

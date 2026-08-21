@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "echo \"run 'pnpm dev-server' in the root directory instead\" >&2 && exit 1",
     "deploy": "vp run --no-cache build:configurator && wrangler deploy",
-    "clean": "rm -rf dist src/generated"
+    "clean": "rimraf dist src/generated"
   },
   "dependencies": {
     "@gadgets/backend-utils": "workspace:*",
