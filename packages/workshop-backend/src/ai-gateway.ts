@@ -24,6 +24,7 @@ const HTTPS_ONLY_PROVIDERS = new Set(["google"]);
 
 export class AiGatewayConfig {
   readonly gateway: string;
+  readonly workersAiGateway?: string;
   /**
    * The gateway name for Workers-AI-binding calls (webFetch's toMarkdown): binding calls only
    * reach gateways in the Worker's own account, so this is the platform gateway whenever the
@@ -91,6 +92,11 @@ export class AiGatewayConfig {
         "CF_AI_GATEWAY_USE_BINDING requires the WORKERS_AI binding; without it the config " +
         "would silently fall back to the HTTPS transport.");
     }
+
+    this.workersAiGateway = env.CF_AI_GATEWAY_WAI_DIRECT === "true"
+      ? undefined
+      : env.CF_AI_GATEWAY_WAI || this.gateway;
+
     if (!this.apiToken && !this.binding) {
       throw new Error(
         "AI Gateway mode needs a transport: bind Workers AI (WORKERS_AI; in local dev start " +
