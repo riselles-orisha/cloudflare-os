@@ -1,6 +1,7 @@
 import { isTransientRpcError, logRpcFailure } from "./rpcErrors";
 import {
   Fragment,
+  isValidElement,
   memo,
   useState,
   useEffect,
@@ -8,6 +9,7 @@ import {
   useRef,
   useMemo,
   useCallback,
+  type ComponentPropsWithoutRef,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
@@ -40,6 +42,7 @@ import {
   ArrowsClockwise,
   Lightning,
   Copy,
+  Clipboard as ClipboardIcon,
   WarningCircle,
   Code,
   File as FileIcon,
@@ -1237,10 +1240,33 @@ function FormatMention({ format }: { format: MessageFormatRef }) {
   );
 }
 
+function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
+  const code = isValidElement<{ children?: ReactNode }>(children) &&
+      typeof children.props.children === "string"
+    ? children.props.children.replace(/\n$/, "")
+    : "";
+
+  return (
+    <div className={styles.codeBlock}>
+      <pre {...props}>{children}</pre>
+      <button
+        type="button"
+        className={styles.codeCopyButton}
+        onClick={() => void copyToClipboard(code)}
+        aria-label="Copy code"
+        title="Copy code"
+      >
+        <ClipboardIcon size={16} />
+      </button>
+    </div>
+  );
+}
+
 function getMarkdownComponents(
   mentionsByToken?: Map<string, Mention>,
 ): Components {
   return {
+    pre: ({ node: _node, ...props }) => <CodeBlock {...props} />,
     table: ({ node: _node, children, ...props }) => (
       <div className={styles.markdownTableWrapper}>
         <table {...props}>{children}</table>
