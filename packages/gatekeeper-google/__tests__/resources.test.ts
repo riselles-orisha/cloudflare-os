@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE, GOOGLE_DOC_RESOURCE,
+  GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE, GOOGLE_SHARED_DRIVE_RESOURCE,
   GOOGLE_SHEETS_RESOURCE, IDENTITY_SCOPES, LEGACY_GRANTED_RESOURCE_URL_PATTERNS, RESOURCE_BY_KIND,
-  RESOURCE_SCOPES, SUPPORTED_RESOURCES, grantedResourcesFromScopes, parseResourceUrl,
-  resourceUrlPatternsToOAuthScopes, validateResourceUrlPatterns,
+  RESOURCE_SCOPES, SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES, hasDriveResourceGrant,
+  parseResourceUrl, resourceUrlPatternsToOAuthScopes, resourcesCoveredByScopes,
+  validateResourceUrlPatterns,
 } from "../src/resources";
 
 /** The message `parseResourceUrl` rejects `url` with. Fails the test if it accepts it. */
@@ -25,8 +27,19 @@ describe("resource declarations", () => {
       "https://docs.google.com/document/d/:docId/*",
       "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
       "https://calendar.google.com/calendar/:calendarId/*",
+      "https://drive.google.com/drive/my-drive",
+      "https://drive.google.com/drive/folders/:driveId",
+      "https://drive.google.com/file/d/:fileId/view",
       "https://bigquery.googleapis.com/:projectId/*",
     ]);
+  });
+
+  it("describes the whole-account Drive authority exactly", () => {
+    expect(GOOGLE_DRIVE_RESOURCE.description).toBe(
+      "Find files and folders anywhere this Google account can read in Drive, including shared " +
+      "drives. Full-text search examines indexed file content, descriptions, and OCR text; " +
+      "results contain metadata only.",
+    );
   });
 
   it("has a distinct pattern per resource", () => {
@@ -44,6 +57,19 @@ describe("resource declarations", () => {
     ]);
   });
 
+  // Inference cannot tell a resource the user chose from one that merely shares a scope with it,
+  // so it is confined to the resources that predate recorded grants. Adding an entry hands every
+  // account holding that scope a grant it never made.
+  it("keeps the scope-derived set frozen at the resources that predate recording", () => {
+    expect(SCOPE_DERIVED_RESOURCE_URL_PATTERNS).toEqual([
+      GMAIL_RESOURCE.urlPattern,
+      GOOGLE_DOC_RESOURCE.urlPattern,
+      GOOGLE_SHEETS_RESOURCE.urlPattern,
+      GOOGLE_CALENDAR_RESOURCE.urlPattern,
+      BIGQUERY_RESOURCE.urlPattern,
+    ]);
+  });
+
   it("maps every parse kind to a declared resource", () => {
     for (let resource of Object.values(RESOURCE_BY_KIND)) {
       expect(SUPPORTED_RESOURCES).toContain(resource);
@@ -57,10 +83,9 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
     expect(resourceUrlPatternsToOAuthScopes([])).toEqual(IDENTITY_SCOPES);
   });
 
-  // undefined means "every resource"; [] means "none". Conflating them would silently grant a
-  // billing-only connection full resource access, or strip a full one.
-  it("distinguishes undefined (all resources) from [] (none)", () => {
-    expect(resourceUrlPatternsToOAuthScopes(undefined).length)
+  it("requires callers to make the full resource set explicit", () => {
+    let allPatterns = SUPPORTED_RESOURCES.map(resource => resource.urlPattern);
+    expect(resourceUrlPatternsToOAuthScopes(allPatterns).length)
       .toBeGreaterThan(resourceUrlPatternsToOAuthScopes([]).length);
   });
 
@@ -71,6 +96,18 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
     ]);
   });
 
+  // Pins the permanent scope each Drive resource is keyed to. Only the first two are
+  // least-privilege: the shared drive needs `drive.readonly` because `drives.list`/`drives.get`
+  // accept nothing narrower, which is why it is the one resource consenting wider than it reads.
+  it.each([
+    [GOOGLE_DRIVE_RESOURCE, "https://www.googleapis.com/auth/drive.metadata.readonly"],
+    [GOOGLE_SHARED_DRIVE_RESOURCE, "https://www.googleapis.com/auth/drive.readonly"],
+    [GOOGLE_DRIVE_FILE_RESOURCE, "https://www.googleapis.com/auth/drive.metadata.readonly"],
+  ] as const)("pins the permanent scope for $urlPattern", (resource, scope) => {
+    expect(resourceUrlPatternsToOAuthScopes([resource.urlPattern])).toEqual([
+      ...IDENTITY_SCOPES, scope,
+    ]);
+  });
   it("deduplicates scopes shared between resources", () => {
     let scopes = resourceUrlPatternsToOAuthScopes(
       [GOOGLE_DOC_RESOURCE.urlPattern, GOOGLE_SHEETS_RESOURCE.urlPattern]);
@@ -84,21 +121,23 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
   });
 });
 
-describe("grantedResourcesFromScopes", () => {
+describe("resourcesCoveredByScopes", () => {
+  let allPatterns = SUPPORTED_RESOURCES.map(r => r.urlPattern);
+
   it("round-trips every resource through its own scopes", () => {
     for (let { resource } of RESOURCE_SCOPES) {
       let scopes = resourceUrlPatternsToOAuthScopes([resource.urlPattern]);
-      expect(grantedResourcesFromScopes(scopes)).toContain(resource.urlPattern);
+      expect(resourcesCoveredByScopes(allPatterns, scopes)).toContain(resource.urlPattern);
     }
   });
 
   it("round-trips the full grant", () => {
-    expect(grantedResourcesFromScopes(resourceUrlPatternsToOAuthScopes(undefined)))
-      .toEqual(SUPPORTED_RESOURCES.map(r => r.urlPattern));
+    expect(resourcesCoveredByScopes(allPatterns, resourceUrlPatternsToOAuthScopes(allPatterns)))
+      .toEqual(allPatterns);
   });
 
   it("reports nothing for identity scopes alone", () => {
-    expect(grantedResourcesFromScopes(IDENTITY_SCOPES)).toEqual([]);
+    expect(resourcesCoveredByScopes(allPatterns, IDENTITY_SCOPES)).toEqual([]);
   });
 
   // Recording a wider grant than was actually made makes ensureResources short-circuit into a
@@ -106,18 +145,56 @@ describe("grantedResourcesFromScopes", () => {
   it("fails closed on a partial grant", () => {
     let calendar = RESOURCE_SCOPES.find(e => e.resource === GOOGLE_CALENDAR_RESOURCE)!;
     expect(calendar.scopes.length).toBeGreaterThan(1);
-    expect(grantedResourcesFromScopes(calendar.scopes.slice(0, 1)))
+    expect(resourcesCoveredByScopes(allPatterns, calendar.scopes.slice(0, 1)))
       .not.toContain(GOOGLE_CALENDAR_RESOURCE.urlPattern);
   });
 
   it("ignores scopes it does not know", () => {
-    expect(grantedResourcesFromScopes(["https://www.googleapis.com/auth/drive"])).toEqual([]);
+    expect(resourcesCoveredByScopes(allPatterns, ["https://www.googleapis.com/auth/drive"]))
+      .toEqual([]);
+  });
+
+  // The whole point of recording the consented set: a resource the user never chose stays out
+  // even when the scopes they did consent to happen to cover it.
+  it("reports only the resources that were actually consented to", () => {
+    let docsOnly = resourceUrlPatternsToOAuthScopes([GOOGLE_DOC_RESOURCE.urlPattern]);
+    expect(resourcesCoveredByScopes([GOOGLE_DOC_RESOURCE.urlPattern], docsOnly))
+      .toEqual([GOOGLE_DOC_RESOURCE.urlPattern]);
+  });
+
+  // The Docs and Sheets pickers request drive.metadata.readonly, which is the entire scope set of
+  // the whole-account and single-file Drive resources. Inferring from scopes therefore reported a
+  // Drive grant for every Docs user, and ensureResources skipped the consent screen for a binding
+  // that could enumerate the account's whole Drive.
+  it("never infers a Drive grant from the Docs or Sheets picker scope", () => {
+    for (let picker of [GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE]) {
+      let scopes = resourceUrlPatternsToOAuthScopes([picker.urlPattern]);
+      expect(scopes).toContain("https://www.googleapis.com/auth/drive.metadata.readonly");
+      expect(resourcesCoveredByScopes(SCOPE_DERIVED_RESOURCE_URL_PATTERNS, scopes))
+        .toEqual([picker.urlPattern]);
+      expect(hasDriveResourceGrant(resourcesCoveredByScopes(
+        SCOPE_DERIVED_RESOURCE_URL_PATTERNS, scopes))).toBe(false);
+    }
+  });
+});
+
+describe("hasDriveResourceGrant", () => {
+  it("accepts each explicit Drive resource and rejects historical non-Drive grants", () => {
+    for (let resource of [
+      GOOGLE_DRIVE_RESOURCE, GOOGLE_SHARED_DRIVE_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE,
+    ]) {
+      expect(hasDriveResourceGrant([resource.urlPattern])).toBe(true);
+    }
+    expect(hasDriveResourceGrant([])).toBe(false);
+    expect(hasDriveResourceGrant([GOOGLE_DOC_RESOURCE.urlPattern, GOOGLE_SHEETS_RESOURCE.urlPattern]))
+      .toBe(false);
+    expect(hasDriveResourceGrant(LEGACY_GRANTED_RESOURCE_URL_PATTERNS)).toBe(false);
   });
 });
 
 describe("validateResourceUrlPatterns", () => {
-  it("accepts undefined and every known pattern", () => {
-    expect(() => validateResourceUrlPatterns(undefined)).not.toThrow();
+  it("accepts an empty or complete explicit set", () => {
+    expect(() => validateResourceUrlPatterns([])).not.toThrow();
     expect(() => validateResourceUrlPatterns(SUPPORTED_RESOURCES.map(r => r.urlPattern)))
       .not.toThrow();
   });
@@ -134,13 +211,13 @@ describe("parseResourceUrl", () => {
     // full mailbox binding. The caller derives the resource -- and hence the admin disable check
     // and the recorded typeUrlPattern -- from what this returns.
     it.each([
-      "https://drive.google.com/drive/folders/abc",
-      "https://drive.google.com/file/d/abc/view",
+      "https://drive.google.com/drive/folders/",
+      "https://drive.google.com/file/d/abc",
       "https://groups.google.com/g/team",
       "https://mail.google.com.evil.example/",
       "https://example.com/",
     ])("rejects %s instead of falling back to Gmail", url => {
-      expect(() => parseResourceUrl(url)).toThrow(/Unsupported Google resource URL/);
+      expect(() => parseResourceUrl(url)).toThrow(/Unsupported Google/);
     });
 
     it("rejects a docs.google.com path that is neither a doc nor a sheet", () => {
@@ -278,6 +355,23 @@ describe("parseResourceUrl", () => {
     it("rejects a missing calendar ID", () => {
       expect(() => parseResourceUrl("https://calendar.google.com/calendar/"))
         .toThrow(/no calendar ID found/);
+    });
+  });
+
+  describe("Drive", () => {
+    it.each([
+      ["account", "https://drive.google.com/drive/my-drive", { kind: "driveAccount" }],
+      ["shared drive", "https://drive.google.com/drive/folders/DRIVE123",
+        { kind: "sharedDrive", driveId: "DRIVE123" }],
+      ["file", "https://drive.google.com/file/d/FILE123/view",
+        { kind: "driveFile", fileId: "FILE123" }],
+    ] as const)("scopes to one %s", (_name, url, expected) => {
+      expect(parseResourceUrl(url)).toEqual(expected);
+    });
+
+    it("rejects paths outside the permanent Drive grammar", () => {
+      expect(() => parseResourceUrl("https://drive.google.com/drive/u/0/my-drive"))
+        .toThrow(/Unsupported Google Drive resource URL/);
     });
   });
 
