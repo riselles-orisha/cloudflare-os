@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind } from '@gadgets/workshop-shared/gatekeeper';
 import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GmailApi, GmailMessageRaw, GmailOutboundMessage, GoogleAccessToken, normalizeEmailRecipients, revokeGoogleToken } from "./google-api";
 import {
   GmailSession, GmailThread, GmailMessage,
@@ -13,6 +13,10 @@ import type {
   GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
 import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
+import { DriveApi } from "./drive-api";
+import { driveObserverTracker } from "./drive-observers";
+import { DriveSessionCore, type DriveBindingScope } from "./drive-session";
+import type { DriveEntry, DriveListOptions, DriveSearchQuery, GoogleDriveSession } from "./drive-types";
 import { BigQueryApi, DEFAULT_MAX_BYTES_BILLED } from "./bigquery-api";
 import {
   BigQueryDataset, BigQueryDryRunResult, BigQueryField, BigQueryProject,
@@ -32,18 +36,25 @@ import DOCS_TYPES_CODE from "./docs-types.txt";
 import BIGQUERY_TYPES_CODE from "./bigquery-types.txt";
 import CALENDAR_TYPES_CODE from "./calendar-types.txt";
 import SHEETS_TYPES_CODE from "./sheets-types.txt";
+import DRIVE_TYPES_CODE from "./drive-types.txt";
 import {
   BigQueryConfiguratorUI,
   CalendarConfiguratorUI,
   GmailConfiguratorUI,
   GoogleDocConfiguratorUI,
   GoogleSheetsConfiguratorUI,
+  DriveAccountConfiguratorUI,
+  DriveFileConfiguratorUI,
+  SharedDriveConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
 import GMAIL_CONFIGURATOR_HTML from "./generated/gmail-configurator-ui.txt";
 import GOOGLE_DOC_CONFIGURATOR_HTML from "./generated/google-doc-configurator-ui.txt";
 import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configurator-ui.txt";
+import DRIVE_ACCOUNT_CONFIGURATOR_HTML from "./generated/drive-account-configurator-ui.txt";
+import DRIVE_FILE_CONFIGURATOR_HTML from "./generated/drive-file-configurator-ui.txt";
+import SHARED_DRIVE_CONFIGURATOR_HTML from "./generated/shared-drive-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
@@ -52,13 +63,35 @@ import {
   validateGmailQueryForGrouping, validateGmailRecipientCount, validateOutboundInput,
 } from "./gmail-validate";
 import {
-  AUTH_SCOPES, BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
-  GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE, LEGACY_GRANTED_RESOURCE_URL_PATTERNS,
-  RESOURCE_BY_KIND, SUPPORTED_RESOURCES, grantedResourcesFromScopes, parseResourceUrl,
-  resourceUrlPatternsToOAuthScopes,
+  BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
+  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE,
+  GOOGLE_SHARED_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, LEGACY_GRANTED_RESOURCE_URL_PATTERNS,
+  RESOURCE_BY_KIND, SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
+  hasDriveResourceGrant, parseResourceUrl, resourcesCoveredByScopes,
 } from "./resources";
-import { ObserverCheck, ObserverTracker } from "./observers";
+import {
+  beginStoredOAuthFlow, claimStoredOAuthFlow, mergeGrantedResources, prepareOAuthFlow,
+  shouldDeleteCredentialsOnAlarm, type OAuthFlowMode,
+} from "./oauth-flow";
+import { type ObserverBatchResult, type ObserverCheck, ObserverTracker } from "./observers";
 import { CursorPager, Pager } from "./cursor";
+import {
+  decodeGoogleOAuthState,
+  decodeLegacyGoogleOAuthState,
+  encodeGoogleOAuthState,
+  encodeLegacyGoogleOAuthState,
+  getBasePath,
+  getBaseUrl,
+  getDynamicGoogleOAuthReturnUrl,
+  getRegisteredGoogleOAuthRedirectUri,
+  isCurrentGoogleOAuthCallback,
+  isGoogleOAuthPreviewRedirectEnabled,
+  isSignedGoogleOAuthState,
+  redirectToGoogleOAuthReturnUrl,
+  validateGoogleOAuthReturnUrl,
+  type GoogleOAuthEnv,
+  type GoogleOAuthState,
+} from "./oauth";
 
 // Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased).
 const VENDOR_ID = "google";
@@ -66,17 +99,7 @@ const logger = obsContext.createLogger({
   component: "gatekeeper.google", vendorId: VENDOR_ID,
 });
 
-// A nonce stored in UserAccount KV to protect the OAuth flow. Only one nonce is active at a time;
-// the `stage` field tracks where we are in the flow.
-type StoredNonce = {
-  value: string;
-  expiresAt: number;
-  stage: "initiation" | "oauth";
-};
-
 const NONCE_BYTES = 32;
-const INITIATION_NONCE_LIFETIME_MS = 10 * 60 * 1000;  // 10 minutes
-const OAUTH_NONCE_LIFETIME_MS = 10 * 60 * 1000;    // 10 minutes
 
 // Ceilings on the OAuth round trips that run while holding the credential mutex. Each must be
 // bounded: an unbounded hang keeps the mutex, and every caller waiting for a token then queues
@@ -99,19 +122,9 @@ function generateNonce(): string {
   return hexEncode(crypto.getRandomValues(new Uint8Array(NONCE_BYTES)));
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  let encoder = new TextEncoder();
-  let bufA = encoder.encode(a);
-  let bufB = encoder.encode(b);
-  if (bufA.byteLength !== bufB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bufA, bufB);
-}
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
-type Env = Cloudflare.Env & {
-  // Base URL (protocol+host+optional path) at which the default fetch handler is served. Should
-  // NOT include a trailing slash. Omit for localhost dev server.
-  BASE_URL?: string;
+type Env = Cloudflare.Env & GoogleOAuthEnv & {
   // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
   CLIENT_ID?: string;
   CLIENT_SECRET?: string;
@@ -138,15 +151,6 @@ function toLabelObjects(labelIds: string[], labelMap: Map<string, string>): Gmai
     let name = labelMap.get(id) || id;
     return { id, name, type: "custom" as const };
   });
-}
-
-function getBaseUrl(env: Env) {
-  return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/google");
-}
-
-function getBasePath(env: Env) {
-  const path = new URL(getBaseUrl(env)).pathname;
-  return path === "/" ? "" : path;
 }
 
 // =======================================================================================
@@ -215,7 +219,21 @@ export default {
       let doId = path[0];
       let initiationNonce = path[1];
       let stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      let begun = await stub.beginOAuthFlow(initiationNonce);
+      let oauthRedirectUri: string;
+      let returnUrl: string | undefined;
+      try {
+        oauthRedirectUri = getRegisteredGoogleOAuthRedirectUri(env);
+        returnUrl = getDynamicGoogleOAuthReturnUrl(env);
+        if (returnUrl && !env.OAUTH_STATE_SIGNING_SECRET) {
+          throw new Error("Google OAuth state signing secret is not configured.");
+        }
+      } catch (error) {
+        return new Response(
+          error instanceof Error ? error.message : "Google OAuth callback is not configured.",
+          { status: 503 },
+        );
+      }
+      const begun = await stub.beginOAuthFlow(initiationNonce, oauthRedirectUri);
       if (begun === null) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
@@ -224,37 +242,89 @@ export default {
 
       let newUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
       newUrl.searchParams.set("client_id", env.CLIENT_ID);
-      newUrl.searchParams.set("redirect_uri", getBaseUrl(env) + "/oauth");
+      newUrl.searchParams.set("redirect_uri", oauthRedirectUri);
       newUrl.searchParams.set("response_type", "code");
       newUrl.searchParams.set("scope", begun.scopes.join(" "));
       newUrl.searchParams.set("access_type", "offline");
       newUrl.searchParams.set("prompt", "consent");
       // Add newly-requested scopes to any the user already granted, rather than replacing them.
       newUrl.searchParams.set("include_granted_scopes", "true");
-      newUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
+      let oauthState: GoogleOAuthState = {
+        userObjectId: doId,
+        oauthNonce: begun.oauthNonce,
+        ...(returnUrl ? { returnUrl } : {}),
+      };
+      let encodedState = encodeLegacyGoogleOAuthState(oauthState);
+      if (returnUrl) {
+        let signingSecret = env.OAUTH_STATE_SIGNING_SECRET;
+        if (!signingSecret) throw new Error("Google OAuth state signing secret is not configured.");
+        encodedState = await encodeGoogleOAuthState(oauthState, signingSecret);
+      }
+      newUrl.searchParams.set("state", encodedState);
 
       return Response.redirect(newUrl.toString(), 302);
     } else if (relPath === "/oauth") {
       // Completion redirect.
 
-      let error = url.searchParams.get("error");
-      if (error) {
-        return new Response(`${error}: ${url.searchParams.get("error_description")}`);
+      let state = url.searchParams.get("state");
+      if (!state) return new Response("Error: no 'state' provided", { status: 400 });
+
+      let oauthState: GoogleOAuthState;
+      try {
+        if (isSignedGoogleOAuthState(state)) {
+          if (!env.OAUTH_STATE_SIGNING_SECRET) {
+            return new Response("Google OAuth state signing secret is not configured.", { status: 500 });
+          }
+          oauthState = await decodeGoogleOAuthState(state, env.OAUTH_STATE_SIGNING_SECRET);
+        } else {
+          oauthState = decodeLegacyGoogleOAuthState(state);
+        }
+      } catch (error) {
+        return new Response(error instanceof Error ? error.message : "Invalid Google OAuth state", {
+          status: 400,
+        });
       }
 
-      let state = url.searchParams.get("state");
-      if (!state) return new Response("Error: no 'state' provided");
-      let colonIdx = state.indexOf(":");
-      if (colonIdx < 0) return new Response("Error: malformed state");
-      let doId = state.slice(0, colonIdx);
-      let oauthNonce = state.slice(colonIdx + 1);
+      if (oauthState.returnUrl) {
+        if (!isGoogleOAuthPreviewRedirectEnabled(env)) {
+          return new Response("Google OAuth return URLs are not allowed.", { status: 400 });
+        }
+        let returnUrl: URL;
+        try {
+          returnUrl = validateGoogleOAuthReturnUrl(oauthState.returnUrl, env);
+        } catch (error) {
+          return new Response(
+            error instanceof Error ? error.message : "Invalid Google OAuth return URL",
+            { status: 400 },
+          );
+        }
+        if (!isCurrentGoogleOAuthCallback(returnUrl, env)) {
+          return redirectToGoogleOAuthReturnUrl(returnUrl, url, state);
+        }
+      }
+
+      let userObjectId;
+      try {
+        userObjectId = ctx.exports.UserAccount.idFromString(oauthState.userObjectId);
+      } catch {
+        return new Response("Error: malformed state", { status: 400 });
+      }
+      let stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(userObjectId);
+
+      let error = url.searchParams.get("error");
+      if (error) {
+        if (!await stub.consumeOAuthNonce(oauthState.oauthNonce)) {
+          return new Response(INVALID_LINK_HTML, {
+            headers: { "Content-Type": "text/html; charset=utf-8" }
+          });
+        }
+        return new Response("Google authorization was not completed.", { status: 400 });
+      }
 
       let code = url.searchParams.get("code");
-      if (!code) return new Response("Error: no 'code' provided");
+      if (!code) return new Response("Error: no 'code' provided", { status: 400 });
 
-      let userObjectId = ctx.exports.UserAccount.idFromString(doId);
-      let stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(userObjectId);
-      if (!await stub.acceptAuthCode(code, oauthNonce)) {
+      if (!await stub.acceptAuthCode(code, oauthState.oauthNonce)) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
@@ -285,12 +355,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       url: "https://google.com",
       logo: { url: GOOGLE_LOGO_URL },
       color: "#e8f0fe",
-      tagline: "Draft replies, edit docs, read sheets, manage calendars, and analyze data",
+      tagline: "Draft replies, edit docs, read sheets, search Drive, manage calendars, analyze data",
       description:
           "Connect your Google account to give Cloudflare OS access to Gmail, Google Docs, Google " +
-          "Sheets, Google Calendar, and BigQuery. Build agents that triage email, draft and edit " +
-          "documents, read spreadsheets, find focus time, schedule meetings, or run analytics " +
-          "queries on your data.",
+          "Sheets, Google Drive, Google Calendar, and BigQuery. Build agents that triage email, " +
+          "draft and edit documents, read spreadsheets, find files by metadata, find focus time, " +
+          "schedule meetings, or run analytics queries on your data.",
       providesAuth: true,
     };
   }
@@ -301,11 +371,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     let initiationNonce = generateNonce();
 
     let authOnly = options?.scopes === "auth";
-    let requestedScopes = authOnly
-        ? AUTH_SCOPES
-        : resourceUrlPatternsToOAuthScopes(options?.resourceUrlPatterns);
+    let requestedResources = authOnly
+        ? []
+        : options?.resourceUrlPatterns ?? SUPPORTED_RESOURCES.map(resource => resource.urlPattern);
+    let mode: OAuthFlowMode = authOnly ? "auth" : "connect";
     await this.ctx.exports.UserAccount.get(userObjectId)
-        .setCallback(callback, initiationNonce, requestedScopes, authOnly);
+        .setCallback(callback, initiationNonce, requestedResources, mode);
 
     return {
       url: `${getBaseUrl(this.env)}/${userObjectId.toString()}/${initiationNonce}`
@@ -325,6 +396,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   async getTypeScriptTypes(): Promise<string> {
     return [
       TYPES_CODE, DOCS_TYPES_CODE, SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE, BIGQUERY_TYPES_CODE,
+      DRIVE_TYPES_CODE,
     ].join("\n");
   }
 }
@@ -357,91 +429,60 @@ export class UserAccount extends DurableObject<Env> {
 
   async setCallback(
       callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
-      requestedScopes: string[], ephemeral?: boolean) {
-    // If we have no API key in 1 hour, delete this object.
+      requestedResources: string[], mode: OAuthFlowMode) {
     if (!this.ctx.storage.kv.get<string>("refreshToken")) {
       this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
     }
 
     this.ctx.storage.kv.put("callback", callback);
-    this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
-    // Auth-only sign-in grants are transient: dropped shortly after the email is read.
-    this.ctx.storage.kv.put<boolean>("ephemeral", ephemeral ?? false);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-    });
+    prepareOAuthFlow(this.ctx.storage.kv, initiationNonce, requestedResources, mode, Date.now());
   }
 
-  /**
-   * Prepare this account for a reconnect flow. The next acceptAuthCode() call will replace the
-   * existing refresh token and notify via credentialsRestored() instead of complete().
-   *
-   * `requestedScopes` is the full set of OAuth scopes to request on the reauthorization. For a
-   * plain reconnect this is the previously-granted set; for a scope expansion it's the union of
-   * the granted scopes and the newly-needed ones.
-   */
-  async prepareReconnect(initiationNonce: string, requestedScopes: string[]) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
-    this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-    });
+  /** Prepare a reconnect or scope-expansion attempt for this account. */
+  async prepareReconnect(initiationNonce: string, requestedResources: string[]) {
+    prepareOAuthFlow(
+      this.ctx.storage.kv, initiationNonce, requestedResources, "reconnect", Date.now());
   }
 
   /**
    * The grantable resource `urlPattern`s currently granted on this account. Used to decide
    * whether ensureResources() needs to expand.
    *
-   * Legacy accounts connected before granular scope tracking have no recorded granted scopes.
-   * Report only the resources included in that historical grant, so newer resources correctly
-   * trigger OAuth scope expansion.
+   * Three generations of account, newest first. An account that consented since grants became
+   * recorded reports exactly what it consented to, re-checked against the scopes Google actually
+   * returned so a declined or later-narrowed scope retracts the grant it backed. An account that
+   * recorded scopes but not resources falls back to inference, confined to the resources that
+   * predate recording — see {@link SCOPE_DERIVED_RESOURCE_URL_PATTERNS} for why it cannot be
+   * extended. An account from before scope tracking reports only its historical grant, so newer
+   * resources correctly trigger an OAuth expansion.
    */
   async getGrantedResourceUrlPatterns(): Promise<string[]> {
-    let granted = this.ctx.storage.kv.get<string[]>("grantedScopes");
-    if (granted === undefined) {
+    let grantedScopes = this.ctx.storage.kv.get<string[]>("grantedScopes");
+    if (grantedScopes === undefined) {
       return [...LEGACY_GRANTED_RESOURCE_URL_PATTERNS];
     }
-    return grantedResourcesFromScopes(granted);
+    let grantedResources = this.ctx.storage.kv.get<string[]>("grantedResources");
+    return resourcesCoveredByScopes(
+        grantedResources ?? SCOPE_DERIVED_RESOURCE_URL_PATTERNS, grantedScopes);
   }
 
-  /**
-   * Called by the fetch handler when the user visits the initiation URL. Verifies the initiation
-   * nonce, consumes it, and returns a fresh OAuth nonce plus the scopes to request. Returns null if
-   * the nonce is invalid or expired.
-   */
-  async beginOAuthFlow(initiationNonce: string): Promise<{oauthNonce: string, scopes: string[]} | null> {
-    let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "initiation" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, initiationNonce)) {
-      return null;
-    }
-
-    // Replace the consumed initiation nonce with a fresh OAuth nonce.
+  /** Begin the stored consent attempt, or return null when its initiation nonce is invalid. */
+  async beginOAuthFlow(initiationNonce: string, oauthRedirectUri: string): Promise<{
+    oauthNonce: string,
+    scopes: string[],
+  } | null> {
     let oauthNonce = generateNonce();
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: oauthNonce,
-      expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
-      stage: "oauth",
-    });
-    // Fall back to all scopes for legacy flows that didn't record a requested set.
-    let scopes = this.ctx.storage.kv.get<string[]>("requestedScopes")
-        ?? resourceUrlPatternsToOAuthScopes();
-    return {oauthNonce, scopes};
+    return beginStoredOAuthFlow(
+        this.ctx.storage.kv, initiationNonce, oauthNonce, oauthRedirectUri, Date.now());
   }
 
+  consumeOAuthNonce(oauthNonce: string): boolean {
+    return claimStoredOAuthFlow(this.ctx.storage.kv, oauthNonce, Date.now()) !== null;
+  }
   /** Returns false if the OAuth nonce is invalid or expired. */
   async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
-    // Verify and consume the OAuth nonce.
-    let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "oauth" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
-    }
-    this.ctx.storage.kv.delete("nonce");
+    let flow = claimStoredOAuthFlow(this.ctx.storage.kv, oauthNonce, Date.now());
+    if (!flow) return false;
 
     let { CLIENT_ID: clientId, CLIENT_SECRET: clientSecret } = this.env;
     if (!clientId || !clientSecret) {
@@ -460,7 +501,7 @@ export class UserAccount extends DurableObject<Env> {
       }
 
       let response = await exchangeAuthCode(
-          code, clientId, clientSecret, getBaseUrl(this.env) + "/oauth",
+          code, clientId, clientSecret, flow.oauthRedirectUri,
           AbortSignal.timeout(AUTH_CODE_EXCHANGE_TIMEOUT_MS));
 
       if (!response.refreshToken) {
@@ -471,21 +512,15 @@ export class UserAccount extends DurableObject<Env> {
       this.ctx.storage.kv.put<GoogleAccessToken>("accessToken", response.accessToken);
       // These credentials are new, so any recorded permanent failure no longer applies
       this.#mintFailure = undefined;
-      // Record what Google actually granted (the user may have declined some requested scopes).
       this.ctx.storage.kv.put<string[]>("grantedScopes", response.grantedScopes);
-      this.ctx.storage.kv.delete("requestedScopes");
-
-      let reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
-      if (reconnecting) this.ctx.storage.kv.delete("reconnecting");
-      return { callback, reconnecting: !!reconnecting };
+      mergeGrantedResources(this.ctx.storage.kv, flow.requestedResources);
+      return { callback, mode: flow.mode };
     });
 
     let callback = completion.callback;
-    if (completion.reconnecting) {
-      // Reconnect flow: credentials replaced above, notify restoration.
+    if (completion.mode === "reconnect") {
       await callback.credentialsRestored();
     } else {
-      // Initial connect flow: create the user entrypoint and notify completion.
       try {
         let props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         await callback.complete(this.ctx.exports.GatekeeperUserImpl({props}));
@@ -493,19 +528,16 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.kv.delete("refreshToken");
         throw err;
       }
-      // Auth-only sign-in grants are transient: the caller has read the email via complete(), so
-      // schedule a prompt self-destruct. We do NOT call the provider's revoke endpoint (that could
-      // invalidate the user's other grants for this OAuth client); we just drop our local copy.
-      if (this.ctx.storage.kv.get<boolean>("ephemeral")) {
+
+      if (completion.mode === "auth") {
+        this.ctx.storage.kv.put("deleteCredentialsOnAlarm", true);
         this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
+      } else {
+        this.ctx.storage.deleteAlarm();
       }
     }
 
     return true;
-  }
-
-  hasRefreshToken() {
-    return this.ctx.storage.kv.get<string>("refreshToken") !== undefined;
   }
 
   /**
@@ -620,12 +652,9 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
-    // grant (used once to read the email for login). Serialized so the wipe cannot land in the
-    // middle of a mint, leaving a freshly minted token behind on a deleted account.
+  async alarm(_alarmInfo?: AlarmInvocationInfo): Promise<void> {
     await this.#updateCredentials(async () => {
-      if (!this.hasRefreshToken() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
+      if (shouldDeleteCredentialsOnAlarm(this.ctx.storage.kv)) {
         this.ctx.storage.deleteAll();
       }
     });
@@ -721,6 +750,20 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         };
         return {class: this.ctx.exports.BigQueryGatekeeperImpl({props}), resource};
       }
+      case "driveAccount":
+      case "sharedDrive":
+      case "driveFile": {
+        let scope: DriveBindingScope;
+        if (target.kind === "driveAccount") {
+          scope = { kind: "account" };
+        } else if (target.kind === "sharedDrive") {
+          scope = { kind: "sharedDrive", driveId: target.driveId };
+        } else {
+          scope = { kind: "file", fileId: target.fileId };
+        }
+        let props: GoogleDriveGatekeeperImplProps = { userObjectId, scope };
+        return { class: this.ctx.exports.GoogleDriveGatekeeperImpl({ props }), resource };
+      }
     }
   }
 
@@ -767,6 +810,27 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
+    if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: DRIVE_ACCOUNT_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveAccountConfiguratorUI()),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: SHARED_DRIVE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken)),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: DRIVE_FILE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveFileConfiguratorUI(getToken)),
+      };
+    }
+
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
   }
 
@@ -780,9 +844,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     let obj = this.ctx.exports.UserAccount.get(id);
     let initiationNonce = generateNonce();
-    // Re-request the scopes already granted so a plain reconnect doesn't narrow access.
-    let requestedScopes = resourceUrlPatternsToOAuthScopes(await obj.getGrantedResourceUrlPatterns());
-    await obj.prepareReconnect(initiationNonce, requestedScopes);
+    let grantedResources = await obj.getGrantedResourceUrlPatterns();
+    await obj.prepareReconnect(initiationNonce, grantedResources);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
@@ -794,12 +857,9 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       return {};
     }
 
-    // Request the union of what's already granted and what's newly needed, so the expansion never
-    // drops existing access.
-    let unionPatterns = new Set([...granted, ...resourceUrlPatterns]);
-    let requestedScopes = resourceUrlPatternsToOAuthScopes([...unionPatterns]);
+    let unionPatterns = [...new Set([...granted, ...resourceUrlPatterns])];
     let initiationNonce = generateNonce();
-    await obj.prepareReconnect(initiationNonce, requestedScopes);
+    await obj.prepareReconnect(initiationNonce, unionPatterns);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
@@ -862,6 +922,7 @@ export interface GoogleVerifierApi extends GatekeeperUserVerifier {
   hasCalendarWriterAccess(calendarId: string): Promise<boolean>;
   hasCalendarFreeBusyAccess(calendarId: string): Promise<boolean>;
   hasDatasetAccess(projectId: string, datasetId: string): Promise<boolean>;
+  verifyDriveFiles(fileIds: string[]): Promise<ObserverBatchResult>;
 }
 
 @validateRpc()
@@ -925,6 +986,17 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       if (isNoAccessStatus(httpStatusFromError(error))) return false;
       throw error;
     }
+  }
+
+  async verifyDriveFiles(fileIds: string[]): Promise<ObserverBatchResult> {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    let granted = await account.getGrantedResourceUrlPatterns();
+    let baselineAllowed = hasDriveResourceGrant(granted);
+    if (!baselineAllowed) return { baselineAllowed, allowed: fileIds.map(() => false) };
+
+    let api = new DriveApi(opts => this.#getToken(opts));
+    return { baselineAllowed, allowed: await api.checkFileAccess(fileIds) };
   }
 }
 
@@ -1204,12 +1276,15 @@ function gmailThreadCursor(
       return entries;
     },
 
-    authorize: entries => ctx.approvalQueue.authorizeObservation({
-      title: `Read ${entries.length} Gmail threads`,
-      description:
-        "Fetch the next page of Gmail threads.\n\n" +
-        formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
-    }),
+    authorize: async entries => {
+      if (entries.length === 0) return;
+      await ctx.approvalQueue.authorizeObservation({
+        title: `Read ${entries.length} Gmail threads`,
+        description:
+          "Fetch the next page of Gmail threads.\n\n" +
+          formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
+      });
+    },
   }));
 }
 
@@ -2885,6 +2960,140 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
       this.#pendingActions.remove(actionId);
       throw error;
     }
+  }
+}
+
+// =======================================================================================
+// Google Drive Gatekeeper
+// =======================================================================================
+
+type GoogleDriveGatekeeperImplProps = {
+  userObjectId: string;
+  scope: DriveBindingScope;
+};
+
+@validateRpc()
+export class GoogleDriveGatekeeperImpl
+    extends DurableObject<Env, GoogleDriveGatekeeperImplProps>
+    implements Gatekeeper<GoogleDriveSession> {
+  #tokens = new AccessTokenCache(opts => {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    return account.getAccessToken(opts);
+  });
+
+  #getAccessToken(opts?: AccessTokenRequest): Promise<string> {
+    return this.#tokens.get(opts);
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    let { scope } = this.ctx.props;
+    if (scope.kind === "account") {
+      return {
+        url: GOOGLE_DRIVE_RESOURCE.urlPattern,
+        title: "Google Drive Account",
+        snippet: GOOGLE_DRIVE_RESOURCE.description,
+        suggestedBindingName: "GOOGLE_DRIVE",
+        tsType: "GoogleDriveSession",
+      };
+    }
+    let api = new DriveApi(opts => this.#getAccessToken(opts));
+    if (scope.kind === "sharedDrive") {
+      let drive = await api.getDrive(scope.driveId);
+      return {
+        url: `https://drive.google.com/drive/folders/${encodeURIComponent(scope.driveId)}`,
+        title: drive.name,
+        snippet: `Find files and folders in organization-owned shared drive "${drive.name}" (metadata only)`,
+        suggestedBindingName: "GOOGLE_SHARED_DRIVE",
+        tsType: "GoogleDriveSession",
+      };
+    }
+    let file = await api.getFile(scope.fileId);
+    return {
+      url: `https://drive.google.com/file/d/${encodeURIComponent(scope.fileId)}/view`,
+      title: file.name,
+      snippet: `Read metadata for Drive file "${file.name}"`,
+      suggestedBindingName: "GOOGLE_DRIVE_FILE",
+      tsType: "GoogleDriveSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions() {
+    return [];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveSession> {
+    let observerTracker = this.#observerTracker();
+    return new GoogleDriveSessionImpl(
+      new DriveApi(opts => this.#getAccessToken(opts)),
+      this.ctx.props.scope,
+      approvalQueue.dup(),
+      fileIds => observerTracker.prepareObservation(fileIds),
+      () => [...observerTracker.observers()].map(([id]) => id),
+    );
+  }
+
+  /** Read-only — no side-effecting actions. */
+  async applyAction(_action: number): Promise<void> {}
+  async rejectAction(_action: number): Promise<void> {}
+  revertAction(_action: number): Promise<void> {
+    throw new Error("Google Drive gatekeeper has no writable actions to revert");
+  }
+
+  #observerTracker(): ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
+    return driveObserverTracker<Fetcher<GoogleVerifierApi>>(
+      this.ctx.storage.kv, this.ctx.props.scope,
+      (verifier, fileIds) => verifier.verifyDriveFiles([...fileIds]));
+  }
+
+  async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    await this.#observerTracker().addObserver(id, user as unknown as Fetcher<GoogleVerifierApi>);
+  }
+
+  async removeObserver(id: string): Promise<void> {
+    this.#observerTracker().removeObserver(id);
+  }
+}
+
+@validateRpc()
+class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSession {
+  #core: DriveSessionCore;
+
+  constructor(
+    api: DriveApi,
+    scope: DriveBindingScope,
+    approvalQueue: RpcStub<ApprovalQueue>,
+    prepareObservation: (fileIds: string[]) => Promise<ObserverCheck<string>>,
+    observerIds: () => string[],
+  ) {
+    super();
+    this.#core = new DriveSessionCore({
+      api,
+      scope,
+      prepareObservation,
+      observerIds,
+      authorize: description => approvalQueue.authorizeObservation(description),
+    });
+  }
+
+  getScope() {
+    return this.#core.getScope();
+  }
+
+  async list(options?: DriveListOptions): Promise<Cursor<DriveEntry>> {
+    return new RpcCursor(await this.#core.list(options));
+  }
+
+  async search(query: DriveSearchQuery): Promise<Cursor<DriveEntry>> {
+    return new RpcCursor(await this.#core.search(query));
+  }
+
+  getEntry(fileId: string): Promise<DriveEntry> {
+    return this.#core.getEntry(fileId);
   }
 }
 

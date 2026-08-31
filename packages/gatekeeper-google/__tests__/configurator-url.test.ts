@@ -8,8 +8,14 @@
 // rather than as a resource the backend rejects after the user has filled the form.
 
 import { describe, expect, it } from "vitest";
+import driveAccountConfigurator from "../src/configurator/drive-account-configurator-ui";
+import driveFileConfigurator from "../src/configurator/drive-file-configurator-ui";
 import gmailConfigurator from "../src/configurator/gmail-configurator-ui";
-import { GMAIL_RESOURCE, parseResourceUrl } from "../src/resources";
+import sharedDriveConfigurator from "../src/configurator/shared-drive-configurator-ui";
+import {
+  GMAIL_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE, GOOGLE_SHARED_DRIVE_RESOURCE,
+  parseResourceUrl,
+} from "../src/resources";
 
 // The configurators never call `ui` from these two methods; it is present only to satisfy the
 // context type, and touching it is a bug.
@@ -24,6 +30,26 @@ const gmailValues = (resourceUrl: string) =>
   gmailConfigurator.initialValuesFromResourceUrl!({
     resourceUrl, resourceUrlPattern: GMAIL_RESOURCE.urlPattern, ui: noUi,
   });
+
+const configurableUrl = (
+  configurator: { resourceUrl?: (context: { values: Record<string, unknown>; ui: never }) => string },
+  values: Record<string, unknown>,
+) => configurator.resourceUrl!({ values, ui: noUi });
+
+// Drive value keys match the urlPattern named groups, so the sandbox runtime's
+// `defaultValuesFromResourceUrl` (not a per-module hook) is the prefill path. This is that fallback:
+// URLPattern groups plus decodeURIComponent, ignoring numeric/wildcard names.
+function valuesFromUrlPattern(resourceUrl: string, resourceUrlPattern: string) {
+  const match = new URLPattern(resourceUrlPattern).exec(resourceUrl);
+  const groups = match?.pathname.groups ?? {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(groups)) {
+    if (typeof value === "string" && value.length > 0 && !/^[0-9]+$/.test(key)) {
+      out[key] = decodeURIComponent(value);
+    }
+  }
+  return out;
+}
 
 describe("Gmail configurator URLs", () => {
   it.for([
@@ -78,5 +104,45 @@ describe("Gmail configurator URLs", () => {
 
     expect(gmailValues(inbox)).toEqual({ mode: "all" });
     expect(parseResourceUrl(inbox)).toEqual({ kind: "gmail" });
+  });
+});
+
+describe("Drive configurator URLs", () => {
+  it("mints the whole-account resource", () => {
+    let url = configurableUrl(driveAccountConfigurator, { scope: "account" });
+    expect(url).toBe(GOOGLE_DRIVE_RESOURCE.urlPattern);
+    expect(parseResourceUrl(url)).toEqual({ kind: "driveAccount" });
+  });
+
+  it("round-trips an encoded shared-drive ID", () => {
+    let values = { driveId: "shared/id with spaces" };
+    let url = configurableUrl(sharedDriveConfigurator, values);
+    expect(url).toBe(
+      GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern.replace(":driveId", encodeURIComponent(values.driveId)),
+    );
+    expect(parseResourceUrl(url)).toEqual({ kind: "sharedDrive", driveId: values.driveId });
+  });
+
+  it("round-trips an encoded file ID", () => {
+    let values = { fileId: "file/id with spaces" };
+    let url = configurableUrl(driveFileConfigurator, values);
+    expect(url).toBe(
+      GOOGLE_DRIVE_FILE_RESOURCE.urlPattern.replace(":fileId", encodeURIComponent(values.fileId)),
+    );
+    expect(parseResourceUrl(url)).toEqual({ kind: "driveFile", fileId: values.fileId });
+  });
+
+  // Prefill after deleting the hand-written hooks: the sandbox fallback extracts named groups and
+  // decodeURIComponent's them. A missing decode would leave `%2F`/`%20` in the form values.
+  it("prefills encoded IDs from urlPattern named groups", () => {
+    let driveValues = { driveId: "shared/id with spaces" };
+    let driveUrl = configurableUrl(sharedDriveConfigurator, driveValues);
+    expect(valuesFromUrlPattern(driveUrl, GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern))
+      .toEqual(driveValues);
+
+    let fileValues = { fileId: "file/id with spaces" };
+    let fileUrl = configurableUrl(driveFileConfigurator, fileValues);
+    expect(valuesFromUrlPattern(fileUrl, GOOGLE_DRIVE_FILE_RESOURCE.urlPattern))
+      .toEqual(fileValues);
   });
 });
