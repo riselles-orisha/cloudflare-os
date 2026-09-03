@@ -1,6 +1,6 @@
 // Vite+ per-package settings. The `test` task definition is shared by every package whose tests run
-// under vitest and lives beside the other shared task configs.
-import { vitestTask, withTestTimeout } from '../../scripts/vitest-task-vite-config.js'
+// under vitest and ships as `@gadgets/scripts/vitest-task`.
+import { vitestTask, withTestTimeout } from '@gadgets/scripts/vitest-task'
 
 /**
  * Codegen steps stay separate commands rather than one `&&` string so each caches on its own.
@@ -19,7 +19,7 @@ export default {
        * not the contents of the directory it names, so edits inside it would replay a stale module.
        */
       'build:format-blueprints': {
-        command: 'node scripts/build-format-blueprints.mjs',
+        command: 'node scripts/build-format-blueprints.ts',
         cache: false,
       },
       'build:browser-runtime': {
