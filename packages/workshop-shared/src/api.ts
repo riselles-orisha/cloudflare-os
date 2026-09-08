@@ -1183,10 +1183,7 @@ export const WORKERS_AI_OUTPUT_LIMIT = 32768;
  * `outputLimit`, when present, is both the requested response cap and the space reserved for it,
  * leaving the remainder as the prompt budget context compaction sizes against.
  */
-export const SUGGESTED_MODELS: Record<
-  AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
-> = {
+const SUGGESTED_MODEL_CATALOG = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
@@ -1221,7 +1218,34 @@ export const SUGGESTED_MODELS: Record<
   },
   "ollama": {
   },
-};
+} satisfies Record<
+  AiModelProvider,
+  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
+>;
+
+export const SUGGESTED_MODELS: Record<
+  AiModelProvider,
+  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
+> = SUGGESTED_MODEL_CATALOG;
+
+/** A model ID listed in SUGGESTED_MODELS, optionally narrowed to one provider's catalog. */
+export type SuggestedModelId<P extends AiModelProvider = AiModelProvider> =
+  { [K in P]: keyof (typeof SUGGESTED_MODEL_CATALOG)[K] & string }[P];
+
+/**
+ * Providers whose pi API adapter refuses a custom fetch, so their inference cannot ride the
+ * Workers AI binding and needs CF_AI_GATEWAY_API_TOKEN over HTTPS. pi's Google adapter throws
+ * "Custom fetch is not supported by the Google Generative AI adapter" whenever the fetch it is
+ * given is not globalThis.fetch, and the client it builds on offers no hook to route around that:
+ * @google/genai's `GoogleGenAI` takes only `httpOptions`, whose knobs are
+ * baseUrl/apiVersion/headers/timeout/extraBody/retryOptions.
+ * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-generative-ai.ts#L80
+ *
+ * pi's Vertex adapter throws the same way, so a google-vertex provider would belong here too; it
+ * is absent only because this deployment has no such provider.
+ * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
+ */
+export const HTTPS_ONLY_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["google"]);
 
 /**
  * Metadata about a workspace (one Overseer DO and everything in it). Includes everything needed
@@ -1582,6 +1606,10 @@ export type AgentSpawnerConfig = {
    *
    * The entries are deliberately not limited to bindings held by the gadget that owns the
    * spawner: a spawner may define bindings of its own, with its own names and targets.
+   *
+   * Once a gadget binds the spawner, every env target joins each "use" collaborator's
+   * verification scope transitively: spawning is reachable from the gadget UI, and the spawned
+   * agent reads these bindings with the spawner creator's authority.
    */
   env: Record<string, WorkpieceId>,
 };
@@ -2238,10 +2266,19 @@ export type AiChatMetadata = {
   activeAgent?: AiChatAuthorInfo,
 
   /**
-   * If true, this chat thread has proposed changes which have not been accepted yet,
-   * including any changes that have not yet been materialized into a durable `changes` message.
+   * The workpieces to which this chat has proposed changes that have not been accepted yet
+   * (including changes not yet materialized into a durable `changes` message): gadgets whose
+   * code the chat modified, gadgets it provisionally created, and gadgets it added a binding to.
+   * Absent (or empty) when the chat proposes nothing -- the pending-changes accept/discard
+   * affordances and per-gadget draft previews key off this list. Derived server-side and
+   * delivered on metadata updates; never submitted by clients.
+   *
+   * Worktrees never appear here for now: the UI has no worktree surface yet, so worktree-only
+   * changes must not prompt the user to accept or discard changes they cannot see. (This
+   * replaces the earlier `hasProposedChanges` boolean; values of that retired field may linger
+   * in stored metadata but are never delivered as truth.)
    */
-  hasProposedChanges?: boolean;
+  proposedChangeWorkpieces?: WorkpieceId[];
 
   /** If this was started from an agent spawner, the spawner's display name. */
   spawnerName?: string;
@@ -2693,6 +2730,36 @@ export type AiChatMessageBody = {
   createdGadgets?: {gadgetId: WorkpieceId, title: string, bindingName: string}[];
 
   /**
+   * Worktrees created as part of this batch of changes (by the agent's `createWorktree` tool).
+   * Deliberately separate from `createdGadgets` so a client can never mistake a worktree for a
+   * gadget creation. Like gadget creations, they are provisional -- a merge through this message
+   * makes the record permanent (it stays private to this chat), and a revert covering it deletes
+   * it. The batch's `pins` include the worktree's birth pin `{gadgetId: worktreeId, baseCommit}`,
+   * which is what content reconstruction roots the worktree's changes at. `bindingName` is the
+   * name in the creating chat's env, recorded so replay can pick it back up.
+   *
+   * Worktree *content* is stripped from every client delivery: clients receive `change` payloads
+   * without worktree entries and `pins` without worktree pins (revision numbering preserved), so
+   * ids in this field are the only worktree trace a client sees. There is no worktree UI yet;
+   * without the stripping, a delivered worktree pin would make the code-sync client fetch an
+   * entire repository tree as a base commit.
+   */
+  createdWorktrees?: {worktreeId: WorkpieceId, title: string, bindingName: string}[];
+
+  /**
+   * Explicit worktree commits made as part of this batch: the agent's `commit()` calls on the
+   * Worktree binding, each advancing the worktree's head from `previousHead` to `commit` (the
+   * new head; also the call's return value). This is the durable, sequence-bearing record of the
+   * advancement: the worktree registry record's head is updated in the same synchronous step
+   * this message is written, and a revert covering this message rolls each affected worktree's
+   * head back to its earliest reverted entry's `previousHead` (entries are ordered within the
+   * message and messages by sequence, so multiple commits per step or per reverted range
+   * compose). The commit objects themselves always remain -- content-addressed, and merely
+   * dangling after a rollback -- so a queued push naming a rolled-back commit stays valid.
+   */
+  worktreeCommits?: {worktreeId: WorkpieceId, commit: string, previousHead: string}[];
+
+  /**
    * Binding edges added to gadgets as part of this batch of changes (by the agent's
    * setGadgetBinding tool, or by the user binding a connection with a chat open -- in the latter
    * case `change` is omitted). Like `createdGadgets`, the additions are
@@ -2733,6 +2800,21 @@ export type AiChatMessageBody = {
    * epochs.
    */
   epochBoundary?: true;
+
+  /**
+   * The chat's worktree re-pins across this merge's epoch reset, present when the chat had live
+   * worktrees. The reset evaporates every pin, but a worktree's uncommitted content must survive
+   * an accept, so the merge re-pins each worktree in the new generation at `baseCommit`: a fresh
+   * local auto-commit capturing its uncommitted overlay when the closed epoch left it dirty,
+   * else its unchanged base. Auto-commits are internal bookkeeping, squashed out of explicit
+   * history -- the worktree's reported head is untouched, and a later explicit commit parents on
+   * that head, never on an auto-commit. This field is the durable record the re-pins are
+   * reconstructed from: content reconstruction and compaction checkpoints re-root worktree
+   * content here, since `pins` on "changes" messages only cover in-epoch establishment. Worktree
+   * *content* is stripped from client deliveries, but this field is not a content-fetch trigger
+   * (unlike a `pins` entry) and rides along untouched.
+   */
+  worktreePins?: {worktreeId: WorkpieceId, baseCommit: string}[];
 } | {
   /**
    * Indicates that at this point in the chat, the user chose to revert all changes starting at the
@@ -3043,6 +3125,44 @@ export type AiToolCall = {
    * doesn't have to re-fetch the blueprint (whose content may have changed since).
    */
   output?: {gadgetId: WorkpieceId, changeId?: number, blueprintNotes?: string};
+} | {
+  /**
+   * Create a new worktree workpiece: a file tree rooted at a git commit, private to the creating
+   * chat, whose files the agent then reads and edits with the regular file tools. Unlike a
+   * gadget, a worktree has no output, no bindings, and cannot execute; its name lives only in
+   * the chat's binding map, never in the workspace default binding list.
+   */
+  toolName: "createWorktree";
+  input: {
+    /** Human-readable title for the new worktree. Required, like a gadget's. */
+    title: string;
+
+    /**
+     * Name under which the worktree appears in the chat's env (see validateBindingName()). The
+     * chat's binding map is the only namespace a worktree name occupies.
+     */
+    bindingName: string;
+
+    /**
+     * The git commit to root the worktree at: a full 40-hex oid or an unambiguous prefix,
+     * resolved against the workspace's local git store and its gatekeeper-provided metadata
+     * (never a remote lookup -- remote refs resolve through gatekeeper APIs first).
+     */
+    commitId: string;
+  };
+
+  /**
+   * The created worktree's workpiece ID, recorded when the worktree was actually created; like
+   * createGadget's output, replay returns this recorded result instead of re-creating.
+   *
+   * `changeId` is the change number of the "changes" batch that records the creation (see
+   * `createdWorktrees` on the "changes" message body), like createGadget's.
+   *
+   * `baseCommit` is the full oid `input.commitId` resolved to -- the commit the worktree is
+   * rooted (and born pinned) at. Recorded because replay needs it to serve reads of untouched
+   * files lazily from the base tree, and the input may be a prefix.
+   */
+  output?: {worktreeId: WorkpieceId, changeId?: number, baseCommit: string};
 } | {
   toolName: "executeCode";
   input: {

@@ -5,6 +5,7 @@
   "description": "Building blocks for gatekeepers: connect-flow, credential, action, observation, and simulation primitives. Not a deployable Worker.",
   "type": "module",
   "exports": {
+    "./action-files": "./src/action-files.ts",
     "./actions": "./src/actions.ts",
     "./auth-retry": "./src/auth-retry.ts",
     "./cache": "./src/cache.ts",
@@ -17,6 +18,7 @@
     "./endpoint": "./src/endpoint.ts",
     "./http-errors": "./src/http-errors.ts",
     "./observers": "./src/observers.ts",
+    "./preview-oauth": "./src/preview-oauth.ts",
     "./response-body": "./src/response-body.ts",
     "./simulation": "./src/simulation.ts"
   },
@@ -27,11 +29,12 @@
   },
   "dependencies": {
     "@gadgets/backend-utils": "workspace:*",
-    "@gadgets/workshop-shared": "workspace:*"
+    "@gadgets/workshop-shared": "workspace:*",
+    "jose": "^6.2.8"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "catalog:",
-    "@cloudflare/workers-types": "^5.20260825.1",
+    "@cloudflare/workers-types": "catalog:",
     "@gadgets/scripts": "workspace:*",
     "typescript": "catalog:",
     "vitest": "catalog:"

@@ -5,8 +5,10 @@
   "type": "module",
   "exports": {
     "./harness": "./src/harness.ts",
+    "./agent-session": "./src/agent-session.ts",
     "./network-interceptor": "./src/network-interceptor.ts",
-    "./rpc-client": "./src/rpc-client.ts"
+    "./rpc-client": "./src/rpc-client.ts",
+    "./mock-model": "./src/mock-model.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",
@@ -21,7 +23,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260825.1",
+    "@cloudflare/workers-types": "catalog:",
     "@gadgets/scripts": "workspace:*",
     "@types/node": "^26.1.0",
     "capnweb-validate": "catalog:",
