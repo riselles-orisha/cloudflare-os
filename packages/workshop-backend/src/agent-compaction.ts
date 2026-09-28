@@ -22,16 +22,20 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 /**
  * How the turn divides the model's window. The reserved response capacity is both withheld from the
- * prompt's budget and sent as the request's response cap. A Cloudflare model configured by hand has
- * no SUGGESTED_MODELS entry to declare its reservation, so the provider's applies.
+ * prompt's budget and sent as the response cap. A model may declare a smaller `compactionInputBudget`
+ * when prompts near its full window are priced or paced worse; compaction then sizes against that
+ * instead of the window. A Cloudflare model configured by hand has no SUGGESTED_MODELS entry to
+ * declare its reservation, so the provider's applies.
  */
 export function getModelTokenLimits(config: AiModelConfig):
     {inputBudget: number, maxOutputTokens?: number} {
   let model = SUGGESTED_MODELS[config.provider][config.model];
-  let maxOutputTokens = model?.outputLimit ??
+  let maxOutputTokens = config.outputLimit ?? model?.outputLimit ??
       (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined);
   return {
-    inputBudget: (model?.contextWindow ?? DEFAULT_CONTEXT_WINDOW) - (maxOutputTokens ?? 0),
+    inputBudget: model?.compactionInputBudget ??
+        (config.contextWindow ?? model?.contextWindow ?? DEFAULT_CONTEXT_WINDOW) -
+            (maxOutputTokens ?? 0),
     maxOutputTokens,
   };
 }
@@ -376,7 +380,6 @@ export function buildCompactionState(
     : Omit<CompactionCheckpoint, "chatId" | "compactedTo" | "summary"> {
   let compacted = messages.filter(message => message.sequence < compactedTo);
   let chatBindings = new Map(previous?.chatBindings ?? initialBindings);
-  let callbackNameCounter = 0;
   let nextChangeId = previous?.nextChangeId ?? 0;
 
   for (let message of compacted) {
@@ -396,11 +399,11 @@ export function buildCompactionState(
         }
       }
     } else if (message.type === "agentCallback") {
-      let name: string;
-      do {
-        name = `PARAMS_${++callbackNameCounter}`;
-      } while (chatBindings.has(name));
-      chatBindings.set(name, {type: "value", messageSequence: message.sequence});
+      // The name was stamped when the call was appended; a message without one predates durable
+      // calls and binds nothing (its arguments are gone).
+      if (message.bindingName !== undefined) {
+        chatBindings.set(message.bindingName, {type: "value", messageSequence: message.sequence});
+      }
     } else if (message.type === "connectionRequest" && message.state === "accepted" &&
                message.gatekeeperId !== undefined && message.bindingName !== undefined) {
       if (!chatBindings.has(message.bindingName)) {
@@ -434,10 +437,10 @@ export function buildCompactionState(
     if (message.type === "merge" && message.epochBoundary) {
       pins.clear();
       epoch = message.sequence;
-      // Worktree pins re-establish at the boundary itself, from the merge's own re-pin record
-      // (see AiChatMessageBody.worktreePins) -- there is no later "changes" declaration to
-      // re-pin them lazily, so the checkpoint must carry them or post-compaction replay would
-      // lose the worktrees' bases.
+      // Merges from before worktrees pinned on modification re-pinned every worktree at the
+      // boundary itself (see AiChatMessageBody.worktreePins) -- no later "changes" declaration
+      // re-pins those lazily, so the checkpoint must carry them or post-compaction replay would
+      // lose the worktrees' bases. Merges written now record no such pins.
       for (let pin of message.worktreePins ?? []) {
         pins.set(pin.worktreeId, {gadgetId: pin.worktreeId, baseCommit: pin.baseCommit});
       }
