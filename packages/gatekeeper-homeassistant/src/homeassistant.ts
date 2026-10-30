@@ -3,6 +3,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
+  workerVersionTag,
   type AccountDescription,
   type AvatarImage,
   type ConnectHandoff,
@@ -18,6 +19,8 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
+import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
 import AREA_CONFIGURATOR_HTML from "./generated/area-configurator-ui.txt";
 import LABEL_CONFIGURATOR_HTML from "./generated/label-configurator-ui.txt";
@@ -260,6 +263,9 @@ function escapeAttr(s: string): string {
 // ---------------------------------------------------------------------------
 // fetch handler: serves the connect form and accepts its POST
 
+// The route checks only path shape before reading the form; the account checks the nonce after.
+const MAX_CONNECT_FORM_BYTES = 16 * 1024;
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -289,9 +295,9 @@ export default {
       }
 
       if (req.method === "POST") {
-        let formData: FormData;
+        let formData: URLSearchParams;
         try {
-          formData = await req.formData();
+          formData = new URLSearchParams(await readTextCapped(req, MAX_CONNECT_FORM_BYTES));
         } catch {
           return new Response("Invalid form submission.", { status: 400 });
         }
@@ -358,6 +364,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     };
   }
 
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
+  }
+
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>): Promise<{ url: string }> {
     const userObjectId = this.ctx.exports.UserAccount.newUniqueId();
     const nonce = generateNonce();
@@ -417,7 +427,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(nonce: string): Promise<void> {
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: nonce,
       expiresAt: Date.now() + NONCE_LIFETIME_MS,
@@ -486,7 +496,7 @@ export class UserAccount extends DurableObject<Env> {
       }
     } else {
       this.ctx.storage.kv.put<StoredCredentials>("credentials", { baseUrl, token });
-      this.ctx.storage.kv.put("expiredNotified", false);
+      clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: HomeAssistantUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props }));
@@ -514,7 +524,7 @@ export class UserAccount extends DurableObject<Env> {
     const creds = commitStagedCredentials<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
     if (!creds) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<StoredCredentials>("credentials", creds);
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
   getCredentials(): HomeAssistantCredentials {
@@ -526,12 +536,8 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async noteCredentialsExpired(): Promise<void> {
-    if (this.ctx.storage.kv.get<boolean>("expiredNotified")) return;
-    this.ctx.storage.kv.put("expiredNotified", true);
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (callback) {
-      await callback.credentialsExpired();
-    }
+    await notifyCredentialsExpiredOnce(this.ctx.storage.kv,
+      this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), "homeassistant");
   }
 
   async alarm(): Promise<void> {

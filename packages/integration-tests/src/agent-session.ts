@@ -5,6 +5,7 @@ import type {
   Overseer, PublicApi, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber,
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
+import type { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import {
   type ConnectedAccount, connect, listConnectedAccounts, logIn, nextUsernames, signUp, stubFor,
   waitFor, RpcTarget,
@@ -42,14 +43,45 @@ export type AgentTurnOutcome =
   | { status: "timedOut"; message: string }
   | { status: "cancelled"; message: string };
 
+/**
+ * One model step's prompt tokens: how far the chat's running totals moved when the Workshop
+ * recorded the step.
+ */
+export type StepUsage = {
+  /** The sequence of the newest agent message the counts cover. */
+  sequence: number;
+  /** Prompt tokens the provider neither read from nor wrote to its prompt cache. */
+  uncachedTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * How many agent messages the counts cover, present only when that is not one: a reconnect's
+   * catch-up delivers the totals of every step it replays at once.
+   */
+  modelSteps?: number;
+};
+
+/** One compaction checkpoint of a chat: the summary that replaces its messages before `to`. */
+export type ChatCompaction = { to: number; summary: string };
+
 /** Canonical state observed after one agent activation ends. */
 export type AgentTurnResult = {
   outcome: AgentTurnOutcome;
   history: AiChatMessage[];
+  /** The chat's compaction checkpoints, oldest first. */
+  compactions: ChatCompaction[];
   workpieces: WorkpieceSummary[];
   usage: {
     lastStepTokens?: number;
     observedCumulativeChatCostUsd?: number;
+    /** The chat's running prompt-token total, cache reads and writes included. */
+    cumulativePromptTokens?: number;
+    /** How many of those the provider read from its prompt cache. */
+    cumulativeCacheReadTokens?: number;
+    /** How many of those the provider wrote to its prompt cache. */
+    cumulativeCacheWriteTokens?: number;
+    /** Every model step of the chat so far, oldest first. */
+    steps?: StepUsage[];
   };
 };
 
@@ -73,6 +105,13 @@ export interface WorkshopAgentSession extends AsyncDisposable {
       ids: readonly [number, ...number[]], options?: AgentTurnOptions): Promise<AgentTurnResult>;
   listActions(options?: ActionListOptions): Promise<ActionHistoryPage>;
   connectedAccount(vendorId: string): ConnectedAccount;
+  /**
+   * Turn on an optional ambient gatekeeper, as the Gatekeepers page does, then come back to the
+   * workspace, which provisions it there when it opens again, and wait until it has.
+   */
+  enableAmbientGatekeeper(vendorId: string): Promise<void>;
+  /** Open the management app of the user's account with `vendorId`, as its Workshop page does. */
+  openGatekeeperApp(vendorId: string): Promise<GatekeeperUiFrame>;
   openGadget(id: WorkpieceId): Promise<ProvisionalGadget>;
   acceptChanges(): Promise<void>;
   /** Rewind the chat's proposed changes from the given "changes" message on (see Overseer). */
@@ -281,6 +320,9 @@ class ChatSubscriber extends RpcTarget implements AiChatSubscriber {
   readonly #latestSequence = new Map<number, number>();
   readonly #metadata = new Map<number, AiChatMetadata>();
   readonly #costUpdates = new Map<number, number>();
+  // Per chat: the newest agent message, and how many arrived since the last recorded step.
+  readonly #agentMessages = new Map<number, { sequence: number; unrecorded: number }>();
+  readonly #steps = new Map<number, StepUsage[]>();
   #costWaiter: {
     chatId: number;
     minimumUpdates: number;
@@ -291,6 +333,7 @@ class ChatSubscriber extends RpcTarget implements AiChatSubscriber {
   metadata(chat: AiChatMetadata): void {
     const previous = this.#metadata.get(chat.id);
     this.#metadata.set(chat.id, chat);
+    this.#recordStep(chat, previous);
     if (chat.totalCost !== undefined &&
         (previous === undefined ? chat.totalCost > 0 : chat.totalCost !== previous.totalCost)) {
       this.#costUpdates.set(chat.id, this.costUpdateCount(chat.id) + 1);
@@ -306,6 +349,13 @@ class ChatSubscriber extends RpcTarget implements AiChatSubscriber {
   message(entry: AiChatMessage): void {
     this.#latestSequence.set(
         entry.chatId, Math.max(this.latestSequence(entry.chatId), entry.sequence));
+    if (entry.type === "message" && entry.author.type === "agent") {
+      const agent = this.#agentMessages.get(entry.chatId);
+      if (agent === undefined || entry.sequence > agent.sequence) {
+        this.#agentMessages.set(
+            entry.chatId, { sequence: entry.sequence, unrecorded: (agent?.unrecorded ?? 0) + 1 });
+      }
+    }
     this.observer?.message(entry);
   }
   changeApplied(
@@ -323,6 +373,31 @@ class ChatSubscriber extends RpcTarget implements AiChatSubscriber {
 
   costUpdateCount(chatId: number): number {
     return this.#costUpdates.get(chatId) ?? 0;
+  }
+
+  steps(chatId: number): StepUsage[] {
+    return [...this.#steps.get(chatId) ?? []];
+  }
+
+  // The Workshop writes a step's messages before the metadata that adds its tokens to the chat's
+  // totals, so a push that moves the totals belongs to the newest agent message seen.
+  #recordStep(chat: AiChatMetadata, previous: AiChatMetadata | undefined): void {
+    const prompt = (chat.promptTokens ?? 0) - (previous?.promptTokens ?? 0);
+    if (prompt === 0) return;
+    const cacheReadTokens = (chat.cacheReadTokens ?? 0) - (previous?.cacheReadTokens ?? 0);
+    const cacheWriteTokens = (chat.cacheWriteTokens ?? 0) - (previous?.cacheWriteTokens ?? 0);
+    const agent = this.#agentMessages.get(chat.id) ?? { sequence: -1, unrecorded: 0 };
+    const step: StepUsage = {
+      sequence: agent.sequence,
+      uncachedTokens: prompt - cacheReadTokens - cacheWriteTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+    };
+    if (agent.unrecorded !== 1) step.modelSteps = agent.unrecorded;
+    this.#agentMessages.set(chat.id, { sequence: agent.sequence, unrecorded: 0 });
+    const steps = this.#steps.get(chat.id) ?? [];
+    steps.push(step);
+    this.#steps.set(chat.id, steps);
   }
 
   async waitForCostUpdates(
@@ -386,6 +461,7 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
   #terminal = false;
   #closed = false;
   #lastHistory: AiChatMessage[] = [];
+  #lastCompactions: ChatCompaction[] = [];
   #lastWorkpieces: WorkpieceSummary[] = [];
   #lastUsage: AgentTurnResult["usage"] = {};
 
@@ -429,7 +505,7 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
   }
 
   // The Workshop aborts a session on purpose when it loses its workspace DO (server.ts,
-  // #openGadgetInternal) and the browser reconnects (main.tsx); the DO itself resumes the
+  // #openWorkspaceInternal) and the browser reconnects (main.tsx); the DO itself resumes the
   // interrupted turn. This client does the same, so a turn is judged on what the product did
   // rather than on the socket. Without it the first eval run sat on a dead socket for the whole
   // 28-minute budget with zero model turns.
@@ -456,7 +532,7 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
       try {
         await this.#beforeCancellationDeadline(async () => {
           const authenticated = await logIn(publicApi, this.username);
-          const workspace = await authenticated.openGadget(this.#workspaceId);
+          const workspace = await authenticated.openWorkspace(this.#workspaceId);
           this.#authenticatedApi = authenticated;
           this.#workspace = workspace;
           this.#publicApi = publicApi;
@@ -602,6 +678,22 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
     const account = this.#accounts.get(vendorId);
     if (account === undefined) throw new Error(`No connected account for vendor "${vendorId}"`);
     return account;
+  }
+
+  async enableAmbientGatekeeper(vendorId: string): Promise<void> {
+    await this.#ready();
+    await this.#authenticatedApi.provisionAmbientAccount(vendorId);
+    (await this.#authenticatedApi.openWorkspace(this.#workspaceId))[Symbol.dispose]();
+    await waitFor(`the workspace's ${vendorId} gatekeeper`, async () =>
+      (await this.#workspace.listObserverRequirements("build"))
+          .some(need => need.vendorId === vendorId) || null);
+  }
+
+  async openGatekeeperApp(vendorId: string): Promise<GatekeeperUiFrame> {
+    await this.#ready();
+    const app = await this.#authenticatedApi.getGatekeeperApp(vendorId);
+    if (app === null) throw new Error(`No management app for vendor "${vendorId}"`);
+    return app;
   }
 
   async openGadget(id: WorkpieceId): Promise<ProvisionalGadget> {
@@ -777,10 +869,19 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
       endSequence: number | undefined, cancellationDeadline?: number): Promise<AgentTurnResult> {
     const chatId = this.#chatId;
     if (chatId === undefined) {
-      return { outcome: observedOutcome, history: [], workpieces: [], usage: {} };
+      return { outcome: observedOutcome, history: [], compactions: [], workpieces: [], usage: {} };
     }
+    // Pages load newest first, each bounded below by the checkpoint before it.
+    const compactions: ChatCompaction[] = [];
+    const loadPage = async (before?: number) => {
+      const page = await this.#workspace.getChatHistory(chatId, before);
+      if (page.compacted !== undefined) {
+        compactions.unshift({ to: page.compacted.to, summary: page.compacted.summary });
+      }
+      return page;
+    };
     const loadState = () => Promise.all([
-      loadAllChatHistory(before => this.#workspace.getChatHistory(chatId, before)),
+      loadAllChatHistory(loadPage),
       this.#workspace.listChats(),
       this.#loadWorkpieces(),
     ]);
@@ -820,16 +921,27 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
     if (metadata.totalCost !== undefined) {
       usage.observedCumulativeChatCostUsd = metadata.totalCost;
     }
+    if (metadata.promptTokens !== undefined) usage.cumulativePromptTokens = metadata.promptTokens;
+    if (metadata.cacheReadTokens !== undefined) {
+      usage.cumulativeCacheReadTokens = metadata.cacheReadTokens;
+    }
+    if (metadata.cacheWriteTokens !== undefined) {
+      usage.cumulativeCacheWriteTokens = metadata.cacheWriteTokens;
+    }
+    const steps = this.#chatSubscriber.steps(chatId);
+    if (steps.length > 0) usage.steps = steps;
     this.#lastHistory = history;
+    this.#lastCompactions = compactions;
     this.#lastWorkpieces = workpieces;
     this.#lastUsage = usage;
-    return { outcome, history, workpieces, usage };
+    return { outcome, history, compactions, workpieces, usage };
   }
 
   #resultWithLastState(outcome: AgentTurnOutcome): AgentTurnResult {
     return {
       outcome,
       history: [...this.#lastHistory],
+      compactions: [...this.#lastCompactions],
       workpieces: [...this.#lastWorkpieces],
       usage: { ...this.#lastUsage },
     };
@@ -881,17 +993,9 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
         stopError = error instanceof Error ? error : new Error(String(error));
       }
       try {
-        // Deleting the workspace schedules an abort of its DO (scheduleAccessRestart), and that
-        // abort drops this session. Dispose only after the drop: an abort that finds no client left
-        // can crash local workerd, and with it every other session on the same Workshop.
-        const dropped = Promise.withResolvers<void>();
-        this.#publicApi.onRpcBroken(() => dropped.resolve());
         await this.#beforeCancellationDeadline(
             () => this.#workspace.deleteSelf(), Date.now() + CANCELLATION_TIMEOUT_MS,
             "Workspace deletion timed out");
-        await this.#beforeCancellationDeadline(
-            () => dropped.promise, Date.now() + CANCELLATION_TIMEOUT_MS,
-            "The Workshop kept the session open after deleting its workspace");
       } catch (error) {
         deleteError = error instanceof Error ? error : new Error(String(error));
       }
@@ -946,12 +1050,14 @@ export async function openAgentSession(
     if (options.userModel !== undefined) {
       await authenticated.addModel(options.userModel.profile, options.userModel.config);
     }
-    const models = await authenticated.listModels();
-    if (!models.some(model => model.id === options.modelId)) {
-      throw new Error(`Model "${options.modelId}" is not available to the test account`);
-    }
     await authenticated.setQuickModel(null);
-    await authenticated.setPreferredModel(options.modelId);
+    // setPreferredModel accepts any model that resolves, not only the ones listModels() offers, so
+    // an eval can compare a superseded (hidden) model with its replacement.
+    try {
+      await authenticated.setPreferredModel(options.modelId);
+    } catch (cause) {
+      throw new Error(`Model "${options.modelId}" is not available to the test account`, { cause });
+    }
     await authenticated.completeOnboarding();
 
     const accounts = new Map<string, ConnectedAccount>();
@@ -963,7 +1069,7 @@ export async function openAgentSession(
       accounts.set(vendorId, account);
     }
 
-    workspace = await authenticated.newGadget();
+    workspace = await authenticated.newWorkspace();
     const { id: workspaceId } = await workspace.getMetadata();
     session = new WorkshopAgentSessionImpl({
       username,

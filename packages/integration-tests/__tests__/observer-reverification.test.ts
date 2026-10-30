@@ -16,7 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
 import type { AuthenticatedApi, Overseer, PublicApi } from "@gadgets/workshop-shared/api";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, testControl, type Harness,
 } from "../src/harness.js";
 import {
   accountLabel, connect, listConnectedAccounts, MAX_OBSERVER_PROMPTS, nextUsernames,
@@ -78,40 +78,23 @@ async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<Connect
  * Tell the gatekeeper what to do the next time it's asked to admit `label` as an observer --
  * everywhere, or only at the binding `resourceUrl` names (a resource-specific outcome wins).
  */
-async function setVerifyOutcome(
+function setVerifyOutcome(
     label: string, outcome: { allow: true } | { allow: false; reason: string },
     resourceUrl?: string): Promise<void> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/verify-outcome",
-    { method: "POST", body: JSON.stringify({ label, resourceUrl, ...outcome }) });
-  if (res.status !== 204) {
-    // The control route answers a rejected body with 400 and a reason, so surface it here rather
-    // than leaving a bare status to be puzzled over.
-    throw new Error(`Setting the verify outcome failed with ${res.status}: ${await res.text()}`);
-  }
+  return testControl(harness, "verify-outcome", { label, resourceUrl, ...outcome });
 }
 
 type ObserverEvent = { resourceUrl: string; type: "add" | "remove"; id: string };
 
 /** The addObserver()/removeObserver() calls one binding's gatekeeper has seen, in order. */
 async function observerEvents(resourceUrl: string): Promise<ObserverEvent[]> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/observer-events",
-    { method: "POST", body: JSON.stringify({ resourceUrl }) });
-  if (res.status !== 200) {
-    throw new Error(`Reading observer events failed with ${res.status}: ${await res.text()}`);
-  }
-  return (await res.json() as { events: ObserverEvent[] }).events;
+  return (await testControl<{ events: ObserverEvent[] }>(harness, "observer-events", { resourceUrl }))
+    .events;
 }
 
 async function ambientVerificationCount(label: string): Promise<number> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/ambient-verification-count",
-    { method: "POST", body: JSON.stringify({ label }) });
-  if (res.status !== 200) {
-    throw new Error(`Reading the ambient verification count failed with ${res.status}: ${await res.text()}`);
-  }
-  return (await res.json() as { count: number }).count;
+  return (await testControl<{ count: number }>(harness, "ambient-verification-count", { label }))
+    .count;
 }
 
 type SharedGadget = {
@@ -140,7 +123,7 @@ async function shareGadgetWithBob(
 
   const aliceAccount = await provisionAccount(aliceApi);
 
-  const overseer = await aliceApi.newGadget();
+  const overseer = await aliceApi.newWorkspace();
   for (const thingName of thingNames) {
     await overseer.newGatekeeper(aliceAccount.id, thingUrl(thingName));
   }
@@ -166,7 +149,7 @@ async function bobOpens(
     shared: SharedGadget, recorder: ObserverConfigRecorder): Promise<RpcStub<Overseer>> {
   const callback = stubFor(recorder);
   try {
-    return await shared.bobApi.openGadget(shared.gadgetId, undefined, callback);
+    return await shared.bobApi.openWorkspace(shared.gadgetId, undefined, callback);
   } finally {
     callback[Symbol.dispose]();
   }
@@ -186,7 +169,7 @@ describe("observer re-verification", () => {
       const [alice] = nextUsernames("alice");
       using aliceApi = await signUp(publicApi, alice);
       const account = await provisionAccount(aliceApi);
-      using overseer = await aliceApi.newGadget();
+      using overseer = await aliceApi.newWorkspace();
 
       using bound = await overseer.newGatekeeper(account.id, thingUrl("bound"));
       using unbound = await overseer.newGatekeeper(account.id, thingUrl("unbound"));
@@ -220,7 +203,7 @@ describe("observer re-verification", () => {
       const aliceAccount = await provisionAccount(aliceApi);
       const bobAccount = await provisionAccount(bobApi);
 
-      const ownerWorkspace = await aliceApi.newGadget();
+      const ownerWorkspace = await aliceApi.newWorkspace();
       const { id: gadgetId } = await ownerWorkspace.getMetadata();
       const collaborator = await ownerWorkspace.addCollaborator(bob, "build");
       if (!collaborator) throw new Error(`Failed to share the gadget with ${bob}`);
@@ -228,7 +211,7 @@ describe("observer re-verification", () => {
 
       // No ObserverConfigCallback is supplied. Opening can only succeed if the Workshop discovers
       // Bob's ambient account itself; the fixture records which account's verifier it receives.
-      using sharedWorkspace = await bobApi.openGadget(gadgetId);
+      using sharedWorkspace = await bobApi.openWorkspace(gadgetId);
       await expect(sharedWorkspace.getMetadata()).resolves.toMatchObject({ id: gadgetId });
       expect(await ambientVerificationCount(accountLabel(bobAccount))).toBe(1);
       expect(await ambientVerificationCount(accountLabel(aliceAccount))).toBe(0);
@@ -368,7 +351,7 @@ describe("observer re-verification", () => {
   it.concurrent("denies terminally with no prompt when the client offers no config channel",
       async () => {
     // The path a collaborator hits by favouriting or sharing a workspace from the sidebar, where
-    // openGadget() is called without a callback. This message is the only thing they ever see.
+    // openWorkspace() is called without a callback. This message is the only thing they ever see.
     //
     // Uses a settled denial rather than an expiry, since there is nothing to repair here anyway.
     await withSession(async publicApi => {
@@ -376,7 +359,7 @@ describe("observer re-verification", () => {
       await bobOpensAndCloses(shared);
       await shared.failBob(DENIED_REASON);
 
-      const error = await shared.bobApi.openGadget(shared.gadgetId).then(
+      const error = await shared.bobApi.openWorkspace(shared.gadgetId).then(
         () => null, (err: unknown) => err as Error);
 
       expect(error).not.toBeNull();

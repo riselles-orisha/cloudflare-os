@@ -1,13 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
+import { SharingManager, SharingStorage } from "../src/sharing.js";
+import type { CollaboratorRecord, ShareKeyRecord } from "../src/storage-schema/overseer-storage.js";
 import {
-  SharingManager,
-  SharingStorage,
-  CollaboratorRecord,
-  ShareKeyRecord,
-} from "../src/sharing.js";
-import {
-  AiChatAuthorInfo, PermissionEdge, CollaboratorRole, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES,
+  AiChatAuthorInfo, PermissionEdge, CollaboratorRole, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES,
 } from "@gadgets/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage.js";
 
@@ -483,10 +479,10 @@ describe("createShareLink", () => {
     expect(linkId).toBe(records[0].id);
   });
 
-  it("forbids creating a link with a higher role than the caller's own", () => {
+  it("forbids creating a link with a higher role than the caller's own", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
-    expect(() => mgr.createShareLink({ caller: collab("a"), role: "build" }))
+    await expect(mgr.createShareLink({ caller: collab("a"), role: "build" }))
         .rejects.toThrow(/higher than your own/);
   });
 });
@@ -533,20 +529,20 @@ describe("newShareLinkKey", () => {
     expect(storage.collaborators.get("a")).toBeUndefined();
   });
 
-  it("forbids a non-owner from copying a link they didn't create", () => {
+  it("forbids a non-owner from copying a link they didn't create", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
-    expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
+    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
         .rejects.toThrow(/only copy/);
   });
 
-  it("forbids copying a link that now grants a higher role than the caller's own", () => {
+  it("forbids copying a link that now grants a higher role than the caller's own", async () => {
     let { storage, mgr } = makeManager();
     // "a" created a build link, then was downgraded to use.
     seedLink(storage, "k1", "a", "build");
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
-    expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
+    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
         .rejects.toThrow(/higher than your own/);
   });
 
@@ -560,7 +556,7 @@ describe("newShareLinkKey", () => {
     // silent no-op: redemption resolves the copy through to the link, which would go untouched.
     let aliasId = [...storage.shareKeys.list()].find(r => r.alias !== undefined)!.id;
     expect(mgr.listShareLinkRecords().map(r => r.id)).toEqual([linkId]);
-    expect(mgr.newShareLinkKey({ caller: owner, linkId: aliasId })).rejects.toThrow(/not found/);
+    await expect(mgr.newShareLinkKey({ caller: owner, linkId: aliasId })).rejects.toThrow(/not found/);
     expect(() => mgr.updateShareLink(owner, aliasId, "x")).toThrow(/not found/);
     expect(() => mgr.revokeShareLink(owner, aliasId, [])).toThrow(/not found/);
   });
@@ -644,9 +640,9 @@ describe("ownerInvitesOnly", () => {
         .rejects.toThrow(/Share links are disabled/);
     expect([...storage.shareKeys.list()].map(r => r.id)).toEqual(["k1"]);
 
-    // Link management isn't an open() failure, so it carries no open-gadget code.
+    // Link management isn't an open() failure, so it carries no open-workspace code.
     let error = await mgr.createShareLink({ caller: owner, role: "use" }).catch(e => e);
-    expect(getOpenGadgetErrorCode(error)).toBeUndefined();
+    expect(getOpenWorkspaceErrorCode(error)).toBeUndefined();
   });
 
   it("persists nothing when the flag flips while a key is being minted", async () => {
@@ -673,7 +669,7 @@ describe("ownerInvitesOnly", () => {
       rawKey: key, profileId: "newbie",
       fetchProfile: async () => { fetched++; return profile("newbie"); },
     })).rejects.toMatchObject({
-      code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled,
+      code: OPEN_WORKSPACE_ERROR_CODES.shareLinksDisabled,
       message: expect.stringMatching(/Share links are disabled/),
     });
 
@@ -689,7 +685,7 @@ describe("ownerInvitesOnly", () => {
     await expect(mgr.redeemShareKey({
       rawKey: key, profileId: "newbie",
       fetchProfile: async () => { flags.ownerInvitesOnly = true; return profile("newbie"); },
-    })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    })).rejects.toMatchObject({ code: OPEN_WORKSPACE_ERROR_CODES.shareLinksDisabled });
     expect(storage.collaborators.get("newbie")).toBeUndefined();
   });
 
@@ -720,7 +716,7 @@ describe("ownerInvitesOnly", () => {
     await expect(mgr.redeemShareKey({
       rawKey: key, profileId: "a",
       fetchProfile: async () => profile("a"),
-    })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    })).rejects.toMatchObject({ code: OPEN_WORKSPACE_ERROR_CODES.shareLinksDisabled });
     expect(storage.collaborators.get("a")!.addedBy).toEqual([
       expect.objectContaining({ type: "shareKey", keyId: linkId }),
     ]);

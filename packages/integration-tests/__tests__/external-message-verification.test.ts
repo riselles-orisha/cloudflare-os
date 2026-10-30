@@ -13,7 +13,7 @@ import type {
   SubmitExternalMessageResult,
 } from "@gadgets/workshop-shared/external-message-gateway";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_VENDOR_ID, testControl, type Harness,
 } from "../src/harness.js";
 import {
   accountLabel, connect, listConnectedAccounts, MAX_OBSERVER_PROMPTS, nextUsernames,
@@ -67,40 +67,25 @@ async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<Connect
  * Submit an external chat message as `callerEmail`, through the fixture worker's control surface
  * (and so through the Workshop's real ExternalMessageGateway entrypoint).
  */
-async function submitExternalMessage(input: {
+function submitExternalMessage(input: {
   callerEmail: string; gadgetKey: string; prompt: string;
 }): Promise<SubmitExternalMessageResult> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/submit-external-message",
-    { method: "POST", body: JSON.stringify({
-        chatKey: `chat-${input.gadgetKey}`, messageKey: crypto.randomUUID(),
-        gadgetTitle: input.gadgetKey, ...input }) });
-  if (res.status !== 200) {
-    throw new Error(`submit-external-message failed with ${res.status}: ${await res.text()}`);
-  }
-  return await res.json() as SubmitExternalMessageResult;
+  return testControl(harness, "submit-external-message", {
+    chatKey: `chat-${input.gadgetKey}`, messageKey: crypto.randomUUID(),
+    gadgetTitle: input.gadgetKey, ...input,
+  });
 }
 
 /** Tell the gatekeeper what to do the next time it's asked to admit `label` as an observer. */
-async function setVerifyOutcome(
+function setVerifyOutcome(
     label: string, outcome: { allow: true } | { allow: false; reason: string }): Promise<void> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/verify-outcome",
-    { method: "POST", body: JSON.stringify({ label, ...outcome }) });
-  if (res.status !== 204) {
-    throw new Error(`Setting the verify outcome failed with ${res.status}: ${await res.text()}`);
-  }
+  return testControl(harness, "verify-outcome", { label, ...outcome });
 }
 
 /** The workspace id behind an external gadgetKey -- the DO id the gateway derives from it. */
 async function externalGadgetId(gadgetKey: string): Promise<string> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/external-gadget-id",
-    { method: "POST", body: JSON.stringify({ gadgetKey }) });
-  if (res.status !== 200) {
-    throw new Error(`external-gadget-id failed with ${res.status}: ${await res.text()}`);
-  }
-  return (await res.json() as { gadgetId: string }).gadgetId;
+  return (await testControl<{ gadgetId: string }>(harness, "external-gadget-id", { gadgetKey }))
+    .gadgetId;
 }
 
 describe("external-message verification", () => {
@@ -121,7 +106,7 @@ describe("external-message verification", () => {
       // Wire the workspace up over the web API: connect a Thing (an account-requiring connection,
       // so collaborators must be observer-verified against it) and add Bob.
       const gadgetId = await externalGadgetId(gadgetKey);
-      using overseer = await aliceApi.openGadget(gadgetId);
+      using overseer = await aliceApi.openWorkspace(gadgetId);
       const gatekeeper = await overseer.newGatekeeper(aliceAccount.id, thingUrl("external"));
       if (!gatekeeper) throw new Error("Failed to create the test connection");
 
@@ -148,7 +133,7 @@ describe("external-message verification", () => {
       const callback = stubFor(
           new ObserverConfigRecorder().alwaysChoose(bobAccount.id, MAX_OBSERVER_PROMPTS));
       try {
-        (await bobApi.openGadget(gadgetId, undefined, callback))[Symbol.dispose]();
+        (await bobApi.openWorkspace(gadgetId, undefined, callback))[Symbol.dispose]();
       } finally {
         callback[Symbol.dispose]();
       }
@@ -184,7 +169,7 @@ describe("external-message verification", () => {
           .resolves.toMatchObject({
             accepted: false, message: expect.stringMatching(/AI model/i) });
       const gadgetId = await externalGadgetId(gadgetKey);
-      using overseer = await aliceApi.openGadget(gadgetId);
+      using overseer = await aliceApi.openWorkspace(gadgetId);
       const gatekeeper = await overseer.newGatekeeper(aliceAccount.id, thingUrl("external-use"));
       if (!gatekeeper) throw new Error("Failed to create the test connection");
       using gadget = await overseer.createGadget("Test Gadget", undefined, "TEST_GADGET");

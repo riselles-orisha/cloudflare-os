@@ -134,7 +134,7 @@ Tools · Choose how much of this server the Gadget may call.
 (•) Choose tools   Only the tools you tick. Anything else is refused, including tools added later.
 
 Allowed tools · 3 selected. Read-only tools return data straight away; the rest queue for approval.
-[ 🔍 Filter tools... ]
+[ 🔍 Filter tools...                                  ]  3 of 14 selected   Select all   Clear
 ☑ Search issues                                                                        read-only
 ☑ Create issue                                                                    needs approval
 ```
@@ -203,10 +203,10 @@ connect their own server.
 - **SSRF is enforced after DNS, not by the blocklist.** The hostname patterns in `endpoint.ts` are a
   legible refusal at connect time; they cannot see through a public hostname that resolves, or
   rebinds, to a private address. The actual boundary is the `global_fetch_strictly_public`
-  compatibility flag in `wrangler.jsonc`, which makes workerd reject reserved IP ranges after
+  compatibility flag in `cloudflare.config.ts`, which makes workerd reject reserved IP ranges after
   resolution on every request and redirect hop. It does not apply under `wrangler dev`, which is
   what keeps `MCP_ALLOW_INSECURE` usable locally.
-- **Sharing UI reports late.** `GadgetMetadata.containsRestrictedData` derives only from
+- **Sharing UI reports late.** `WorkspaceMetadata.containsRestrictedData` derives only from
   `ObservationDescription.containsRestrictedData`, so creating a share key appears to succeed and
   fails when the recipient opens it (their observer verification is refused). Fixing this needs a
   kernel change.

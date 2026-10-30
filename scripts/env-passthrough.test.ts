@@ -56,6 +56,16 @@ const EXPECTED: Record<string, ExpectedArea> = {
     forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
     injected: ["GATEKEEPER_APP_UNMINIFIED"],
   },
+  // The live-tenant suite (`vitest.contract.config.ts`) and its sign-in and rendering tooling under
+  // `scripts/` run as package.json scripts and by hand, never as vp tasks.
+  "packages/gatekeeper-microsoft": {
+    external: ["MICROSOFT_CONTRACT_BASE_URL", "MICROSOFT_CONTRACT_TOKENS"],
+  },
+  // `build/runtime.ts` defines `process.env.NODE_ENV` as "production" for the libraries it bundles
+  // into the configurator runtime; the ambient value is never read.
+  "packages/configurator-ui": {
+    injected: ["NODE_ENV"],
+  },
   // `src/worker-inputs.ts` resolves BUNDLED_BLUEPRINTS_DIR only to name a directory for the watcher
   // and `forceRerunTriggers`. The `test` task is cached and strips it; `vitest run` never reads
   // those exports, and `pnpm test:watch` is a script, so it keeps the ambient value.
@@ -63,8 +73,8 @@ const EXPECTED: Record<string, ExpectedArea> = {
     injected: ["WORKSHOP_INTEGRATION_PREBUILT"],
     watch: ["BUNDLED_BLUEPRINTS_DIR"],
   },
-  // `env: ['VITE_*']` — vite's `define` inlines any VITE_-prefixed variable, so the set this
-  // package can depend on is open-ended and the wildcard is the only honest declaration.
+  // `cache: { env: ['VITE_*'] }` — vite's `define` inlines any VITE_-prefixed variable, so the set
+  // this package can depend on is open-ended and the wildcard is the only honest declaration.
   "packages/workshop-frontend": {
     forwarded: [
       "VITE_BACKEND_HOST",
@@ -81,17 +91,21 @@ const EXPECTED: Record<string, ExpectedArea> = {
   },
   // `build-gatekeeper-configurator.ts` is covered in detail by
   // build-gatekeeper-configurator.test.ts, which pins its reads against the shared task's `env`.
-  // `build-release.ts`, `run-local.ts` and `preview/` are invoked directly, never as vp tasks.
-  // `TESTS_WITH_TIMEOUT_DISABLE` is `with-timeout.ts`'s off switch. Every cached task that wraps
-  // the watchdog declares it in `env` via `TESTS_WITH_TIMEOUT_ENV`; `vitest-task.test.ts` pins that.
+  // `build-release.ts`, `run-dev-server.ts`, `run-local.ts` and `preview/` are invoked directly,
+  // never as vp tasks.
+  // Every cached watchdogged task declares the timeout policy via TESTS_WITH_TIMEOUT_ENV;
+  // vitest-task.test.ts pins the shared declaration.
   scripts: {
-    forwarded: ["TESTS_WITH_TIMEOUT_DISABLE", "VITE_FRONTEND_ERROR_REPORTING"],
+    forwarded: [
+      "TESTS_WITH_TIMEOUT_DISABLE", "TESTS_WITH_TIMEOUT_IDLE_SECONDS",
+      "TESTS_WITH_TIMEOUT_MAX_SECONDS", "VITE_FRONTEND_ERROR_REPORTING",
+    ],
     external: [
       "CF_ACCESS_AUD", "CF_ACCESS_ISS", "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID",
       "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_USE_BINDING",
       "CI_COMMIT_SHA", "CI_PIPELINE_IID", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
-      "GITHUB_REPOSITORY", "GITHUB_TOKEN", "PREVIEW_ADMINS", "PREVIEW_GITHUB_CLIENT_ID",
-      "PREVIEW_GITHUB_CLIENT_SECRET", "PREVIEW_NAME", "PREVIEW_PR_NUMBER",
+      "CLOUDFLARE_OS_DEPLOYMENT", "GITHUB_REPOSITORY", "GITHUB_TOKEN", "PREVIEW_ADMINS",
+      "PREVIEW_GITHUB_CLIENT_ID", "PREVIEW_GITHUB_CLIENT_SECRET", "PREVIEW_NAME", "PREVIEW_PR_NUMBER",
       "PREVIEW_WORKERS_DEV_HOST", "PREVIEW_WRANGLER", "VITE_BACKEND_HOST",
       // Read by `vp/concurrency.ts` in the wrapper before `vp` starts, never inside a task.
       "VP_RUN_CONCURRENCY_LIMIT",
@@ -163,8 +177,9 @@ function readsUnder(directory: string): Set<string> {
 }
 
 // Comments in these files quote the very syntax being searched for — workshop-backend's explains why
-// it is `cache: false` "rather than `env: ['BUNDLED_BLUEPRINTS_DIR']`" — so scanning raw source both
-// reads declarations out of prose and lets a deleted one keep passing. Strip comments first.
+// it is `cache: false` "rather than `cache: { env: ['BUNDLED_BLUEPRINTS_DIR'] }`" — so scanning raw
+// source both reads declarations out of prose and lets a deleted one keep passing. Strip comments
+// first.
 const stripComments = (source: string) =>
   source.replaceAll(/\/\*[\s\S]*?\*\//g, "").replaceAll(/\/\/.*$/gm, "");
 

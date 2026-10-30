@@ -2,7 +2,7 @@
 /* eslint-disable react/react-in-jsx-scope */
 
 import { act } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import type {
   ActionLogEntry, AiChatMessage, AiChatMetadata, AiChatSubscriber, Overseer,
@@ -15,6 +15,8 @@ vi.stubGlobal('ResizeObserver', class {
 // jsdom lays nothing out; the message list scrolls itself to the bottom on every render.
 Element.prototype.scrollTo = () => {}
 
+const addToast = vi.hoisted(() => vi.fn<(options: unknown) => void>())
+
 vi.mock('@cloudflare/kumo', async (importOriginal) => {
   const actual = await importOriginal() as typeof import('@cloudflare/kumo')
   const Pass = ({ children }: { children?: React.ReactNode }) => children ?? null
@@ -22,7 +24,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   const parts = new Proxy(Pass, {
     get: (_target, property) => property === 'Root' ? Null : Pass,
   })
-  const toasts = { add: vi.fn<(options: unknown) => void>() }
+  const toasts = { add: addToast }
   return {
     ...actual,
     Dialog: parts,
@@ -44,7 +46,9 @@ vi.mock('./AuthContext', () => {
   }
 })
 
-import { entry, makeOverseer, makeTestRoot } from './action-test-harness'
+import {
+  clickHookSwitch, deferred, entry, flushFrames, hookSwitch, makeOverseer, makeTestRoot,
+} from './action-test-harness'
 import ChatInterface from './ChatInterface'
 import { INCOMPLETE_DESCRIPTION_COPY } from './components/IncompleteDescriptionNotice'
 import { RESTRICTED_APPROVAL_COPY } from './components/RestrictedApprovalNotice'
@@ -73,6 +77,7 @@ function withChatApi(
       subscriber = next
       return { [Symbol.dispose]: () => {} }
     },
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   return {
     getChatMessage,
@@ -288,4 +293,237 @@ describe('action fields', () => {
       expect(document.body.textContent).toContain('Send the following email to alice@example.com:')
     })
   }
+})
+
+// The server's refusal for a chat whose model an administrator disabled.
+const disabledModel = 'The "Kimi K3" model is disabled on this deployment by an administrator.'
+
+const openChat = { id: 1, title: 'Chat', started: new Date(), lastActive: new Date() }
+
+// Types into the composer on screen and submits it with Enter.
+async function sendFromComposer(text: string) {
+  const textarea = document.querySelector<HTMLTextAreaElement>('textarea[role="combobox"]')
+  if (!textarea) throw new Error('No composer rendered')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(textarea, text)
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await act(async () => {
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+  })
+  return textarea
+}
+
+describe('send and retry failures', () => {
+  beforeEach(() => {
+    addToast.mockClear()
+    // Each failure is logged as well as shown.
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'debug').mockImplementation(() => {})
+  })
+
+  it('says why a message could not be sent and keeps it in the composer', async () => {
+    const server = makeOverseer()
+    withChatApi(server, undefined, [openChat])
+    Object.assign(server.overseer as object, {
+      sendChatMessage: async () => { throw new Error(disabledModel) },
+    })
+    await renderChat(server.overseer, { selectedChatId: 1 })
+
+    const textarea = await sendFromComposer('Summarize the report')
+
+    expect(addToast).toHaveBeenCalledExactlyOnceWith(
+        { title: 'Failed to send message', description: disabledModel, variant: 'error' })
+    expect(textarea.value).toBe('Summarize the report')
+  })
+
+  it('says why a conversation could not be started', async () => {
+    const server = makeOverseer()
+    withChatApi(server)
+    Object.assign(server.overseer as object, {
+      newChat: async () => { throw new Error(disabledModel) },
+    })
+    await renderChat(server.overseer)
+
+    const textarea = await sendFromComposer('Summarize the report')
+
+    expect(addToast).toHaveBeenCalledExactlyOnceWith(
+        { title: 'Failed to start conversation', description: disabledModel, variant: 'error' })
+    expect(textarea.value).toBe('Summarize the report')
+  })
+
+  it('raises no toast for a send the connection dropped', async () => {
+    const server = makeOverseer()
+    withChatApi(server, undefined, [openChat])
+    const sendChatMessage = vi.fn<() => Promise<void>>(async () => {
+      throw new Error('Peer closed WebSocket: 1006 ')
+    })
+    Object.assign(server.overseer as object, { sendChatMessage })
+    await renderChat(server.overseer, { selectedChatId: 1 })
+
+    const textarea = await sendFromComposer('Summarize the report')
+
+    expect(sendChatMessage).toHaveBeenCalledOnce()
+    expect(addToast).not.toHaveBeenCalled()
+    expect(textarea.value).toBe('Summarize the report')
+  })
+
+  // Renders chat 1 ending in an agent error, then presses its Retry.
+  async function retryAfterError(retryAgent: () => Promise<void>) {
+    const server = makeOverseer()
+    const chat = withChatApi(server, undefined, [openChat])
+    Object.assign(server.overseer as object, { retryAgent })
+    await renderChat(server.overseer, { selectedChatId: 1 })
+    chat.emitMessage({
+      chatId: 1,
+      sequence: 0,
+      timestamp: new Date(),
+      author: { type: 'agent', id: 'model', name: 'Model' },
+      type: 'error',
+      message: 'The model request failed.',
+    })
+    const retry = [...document.querySelectorAll('button')].find(b => b.textContent === 'Retry')
+    if (!retry) throw new Error('No Retry button rendered')
+    await act(async () => retry.click())
+  }
+
+  it('says why a retry failed', async () => {
+    await retryAfterError(async () => { throw new Error(disabledModel) })
+
+    expect(addToast).toHaveBeenCalledExactlyOnceWith(
+        { title: 'Failed to retry agent', description: disabledModel, variant: 'error' })
+  })
+
+  it('reports a retry the connection dropped without the transport message', async () => {
+    await retryAfterError(async () => { throw new Error('Peer closed WebSocket: 1006 ') })
+
+    expect(addToast).toHaveBeenCalledExactlyOnceWith(
+        { title: 'Failed to retry agent', description: undefined, variant: 'error' })
+  })
+})
+
+describe('hook toggles', () => {
+  const TITLE = 'Watch acme/widgets on GitHub'
+  const refusal = "GitHub refused to add a webhook to acme/widgets: only the repository's admins can."
+  const bound = (enabled: boolean) => entry(1, {
+    type: 'bindHook', state: 'approved', hookId: 7, enabled,
+    description: { title: TITLE, description: 'Call this hook with each issue event.' },
+  })
+
+  beforeEach(() => {
+    addToast.mockClear()
+    // Each failure is logged as well as shown.
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  /** The open chat showing the card of a hook bound in it, whose enable/disable calls the test answers. */
+  async function renderHookCard(enabled = false) {
+    const server = makeOverseer()
+    const chat = withChatApi(server, undefined, [openChat])
+    const enableHook = vi.fn<(id: number) => Promise<void>>(async () => {})
+    const disableHook = vi.fn<(id: number) => Promise<void>>(async () => {})
+    Object.assign(server.overseer as object, { enableHook, disableHook })
+    await renderChat(server.overseer, { selectedChatId: 1 })
+    await server.resolveSubscription()
+    chat.emitMessage({ ...actionMessage, actionLog: bound(enabled) } as AiChatMessage)
+    return { server, enableHook, disableHook }
+  }
+
+  const isOn = () => hookSwitch(TITLE).getAttribute('aria-checked') === 'true'
+
+  /** The server's update of the hook's record, which the card follows. */
+  async function recorded(server: ReturnType<typeof makeOverseer>, enabled: boolean) {
+    await server.emit(bound(enabled))
+    flushFrames()
+  }
+
+  it('turns a hook bound in the chat on and off', async () => {
+    const { server, enableHook, disableHook } = await renderHookCard()
+    expect(hookSwitch(TITLE).getAttribute('role')).toBe('switch')
+
+    await clickHookSwitch(TITLE)
+    expect(enableHook).toHaveBeenCalledExactlyOnceWith(7)
+    await recorded(server, true)
+    expect(isOn()).toBe(true)
+
+    await clickHookSwitch(TITLE)
+    expect(disableHook).toHaveBeenCalledExactlyOnceWith(7)
+    await recorded(server, false)
+    expect(isOn()).toBe(false)
+    expect(addToast).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['enabled', false, 'enableHook', new Error(refusal), refusal],
+    ['enabled', false, 'enableHook', new Error('Peer closed WebSocket: 1006 '), undefined],
+    ['disabled', true, 'disableHook', new Error(refusal), refusal],
+    ['disabled', true, 'disableHook', new Error('Peer closed WebSocket: 1006 '), undefined],
+  ] as const)(
+    'says why a hook could not be %s, though not a dropped connection’s transport message, and turns it back',
+    async (done, enabled, method, failure, description) => {
+      const calls = await renderHookCard(enabled)
+      calls[method].mockRejectedValueOnce(failure)
+
+      await clickHookSwitch(TITLE)
+
+      expect(addToast).toHaveBeenCalledExactlyOnceWith({
+        title: `Failed to ${done === 'enabled' ? 'enable' : 'disable'} hook`, description, variant: 'error',
+      })
+      expect(isOn()).toBe(enabled)
+    })
+
+  it('shows a change at once, holds the switch busy while it is in flight, and lets a failed one be retried', async () => {
+    const { server, enableHook, disableHook } = await renderHookCard()
+    const first = deferred()
+    enableHook.mockReturnValueOnce(first.promise)
+
+    await clickHookSwitch(TITLE)
+    expect(isOn()).toBe(true)
+    expect(hookSwitch(TITLE).getAttribute('aria-disabled')).toBe('true')
+    expect(hookSwitch(TITLE).getAttribute('aria-busy')).toBe('true')
+    await clickHookSwitch(TITLE)
+    expect(enableHook).toHaveBeenCalledOnce()
+    expect(disableHook).not.toHaveBeenCalled()
+
+    await first.reject(new Error(refusal))
+    expect(isOn()).toBe(false)
+    expect(hookSwitch(TITLE).hasAttribute('aria-disabled')).toBe(false)
+    expect(hookSwitch(TITLE).hasAttribute('aria-busy')).toBe(false)
+
+    await clickHookSwitch(TITLE)
+    expect(enableHook).toHaveBeenCalledTimes(2)
+    await recorded(server, true)
+    expect(isOn()).toBe(true)
+  })
+})
+
+describe('queued steers', () => {
+  it('shows every queued steer and hands them all to the draft on Stop', async () => {
+    const server = makeOverseer()
+    const agent = { type: 'agent', id: 'model', name: 'Model' } as const
+    withChatApi(server, undefined, [{
+      ...openChat,
+      activeAgent: agent,
+      queuedSteers: [
+        { text: 'Make it dark.', author: { type: 'user', id: 'me', name: 'Me' } },
+        { text: 'And bigger.', author: { type: 'user', id: 'collaborator', name: 'Collaborator' } },
+      ],
+    }])
+    const stopAgent = vi.fn<(chatId: number) => Promise<void>>(async () => {})
+    Object.assign(server.overseer as object, { stopAgent })
+    await renderChat(server.overseer, { selectedChatId: 1 })
+
+    const text = document.body.textContent ?? ''
+    expect(text.indexOf('Make it dark.')).toBeGreaterThan(-1)
+    expect(text.indexOf('And bigger.')).toBeGreaterThan(text.indexOf('Make it dark.'))
+    expect(text).toContain('Collaborator')
+
+    const stop = document.querySelector<HTMLButtonElement>('[aria-label="Stop agent"]')
+    if (!stop) throw new Error('No Stop button rendered')
+    await act(async () => stop.click())
+
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[role="combobox"]')
+    expect(textarea?.value).toBe('Make it dark.\n\nAnd bigger.')
+    expect(stopAgent).toHaveBeenCalledExactlyOnceWith(1)
+  })
 })

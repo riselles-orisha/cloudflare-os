@@ -63,11 +63,15 @@ async function commitFiles(impl: any, files: Record<string, string>): Promise<st
 }
 
 // Spawns a chat through the spawner binding a gadget would hold, returning its chat id.
-async function spawnChat(impl: any, config: AgentSpawnerConfig): Promise<number> {
+async function spawnChat(impl: any, {env, ...config}: AgentSpawnerConfig): Promise<number> {
   let cls = impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
-    overseerId: impl.ctx.id.toString(), config, creatorUserId: OWNER_USER_ID,
+    config, creatorUserId: OWNER_USER_ID,
   } });
-  let binding: AgentSpawnerBinding = await impl.getGatekeeperFacet(900, cls).startSession(undefined);
+  let bindings = Object.fromEntries(
+      Object.entries(env).map(([name, target]) => [name, { target }]));
+  let client = await impl.addGatekeeper(
+      cls, { type: "agentSpawner", config }, OWNER_USER_ID, undefined, bindings);
+  let binding: AgentSpawnerBinding = await client.openSession();
   await binding.spawn("Task", "Do the task.");
   let [meta] = [...impl.storage.chatMeta.list()];
   return meta.id;
@@ -188,6 +192,28 @@ describe("spawned agent tools", () => {
       "README.md:1:hello\nsrc/util.js:1:export let answer = 42;",
       "src/new.js:1:let answer = 43;\nsrc/util.js:1:export let answer = 42;",
     ]);
+  }));
+
+  it("tells an edit of a missing file apart from an edit of an unread one",
+      () => withImpl(async impl => {
+    let commit = await commitFiles(impl, { "README.md": "hello\n" });
+    let chatId = await spawnChat(impl, { displayName: "Spawner", modelId: "m", env: {} });
+    let edit = { workpiece: "REPO", textToReplace: "hello", replacement: "bye" };
+
+    await runScriptedTurn(impl, chatId, [
+      fauxAssistantMessage([
+        fauxToolCall("createWorktree", { title: "Repo", bindingName: "REPO", commitId: commit }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage([
+        fauxToolCall("editFile", { ...edit, filename: "README.md" }),
+        fauxToolCall("editFile", { ...edit, filename: "REPO/README.md" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    let [unread, missing] = toolCalls(impl, chatId).filter(call => call.toolName === "editFile");
+    expect(unread.error).toMatch(/must read a file/);
+    expect(missing.error).toMatch(/has no file named "REPO\/README\.md"/);
   }));
 
   it("refuses a new binding named GIT, which would shadow env.GIT",

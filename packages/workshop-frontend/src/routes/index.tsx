@@ -1,10 +1,11 @@
-import { classifyRpcError, logRpcFailure } from "../rpcErrors";
+import { classifyRpcError, logRpcFailure, rpcFailureDescription } from "../rpcErrors";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useKumoToastManager } from "@cloudflare/kumo";
 import { ChatComposer } from "../features/chat/composer/ChatComposer";
 import MeshBackground from "../components/MeshBackground";
 import HomeTaskSuggestions from "../components/AppShell/HomeTaskSuggestions";
+import { UpdateAvailableNotice } from "../features/deployment-updates/UpdateAvailableNotice";
 import { useAuthenticatedApi } from "../AuthContext";
 import { RpcStub } from "capnweb";
 import {
@@ -23,12 +24,20 @@ import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
 
-type HomeSearch = { prompt?: string };
+type HomeSearch = {
+  prompt?: string;
+  cfos_native_state?: string;
+  cfos_native_key?: string;
+};
 
 export const Route = createFileRoute("/")({
   component: HomePage,
   validateSearch: (search: Record<string, unknown>): HomeSearch => ({
     prompt: homePromptFromSearch(search.prompt),
+    cfos_native_state: typeof search.cfos_native_state === "string"
+      ? search.cfos_native_state : undefined,
+    cfos_native_key: typeof search.cfos_native_key === "string"
+      ? search.cfos_native_key : undefined,
   }),
 });
 
@@ -89,7 +98,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
 
   const ensureProvisionalGadget = useCallback(() => {
     if (!provisionalOverseerRef.current) {
-      const overseer = authenticatedApi.newGadget();
+      const overseer = authenticatedApi.newWorkspace();
       provisionalOverseerRef.current = { stub: overseer };
     }
   }, [authenticatedApi]);
@@ -130,7 +139,11 @@ export function HomePageContent({ prompt }: HomeSearch) {
           provisionalOverseerRef.current = null;
         }
         if (!transient) {
-          toasts.add({ title: "Failed to create workspace", variant: "error" });
+          toasts.add({
+            title: "Failed to create workspace",
+            description: rpcFailureDescription(err),
+            variant: "error",
+          });
         }
         throw err;
       }
@@ -155,6 +168,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
     // Flat enterprise treatment: no mesh, no watermark hexagon, no prompt-glow. The AppShell's
     // <main> already supplies a faint dotted grid as the page background.
     <div className="relative isolate flex min-h-full w-full flex-col items-center justify-start px-4 pb-16 pt-10 sm:px-8 sm:pt-16 lg:pt-24">
+      <UpdateAvailableNotice />
       {/* The brand hex mesh, restored and de-warmed for the new system: a gentle perspective hex
           grid receding upward. Masked to fade out before the composer so it stays a quiet backdrop. */}
       <div
@@ -187,7 +201,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
           onSend={handleSend}
           isAgentActive={false}
           models={models}
-          selectedModel={selectedModel}
+          selectedModel={selectedModel === null ? null : { id: selectedModel }}
           onModelChange={handleModelChange}
           newChat
           offerFormats
