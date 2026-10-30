@@ -1,3 +1,5 @@
+/// <reference types="vitest/browser" />
+
 // The hierarchy picker in Chromium, on preact/compat: real pointer and keyboard input and focus.
 // Covers what the user's choices select, that a choice lasts only while it is in view,
 // pre-fill, paging, search, tabs, and what it does with a misbehaving source.

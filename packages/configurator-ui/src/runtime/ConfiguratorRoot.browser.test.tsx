@@ -1,3 +1,5 @@
+/// <reference types="vitest/browser" />
+
 // The runtime in Chromium, on preact/compat: what the host is told about readiness, what it may
 // collect, and the controls a module renders, under real pointer and keyboard input.
 
