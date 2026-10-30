@@ -170,7 +170,7 @@ describe("selection", () => {
     const drawsSpace = () => option(choice.title).element().querySelector("[data-testid='space-icon']");
 
     await userEvent.click(option("Engineering"));
-    await expect.element(option(choice.title)).toMatchTextContent(`${choice.title}${choice.subtitle}`);
+    await expect.element(option(choice.title)).toHaveTextContent(`${choice.title}${choice.subtitle}`);
     expect(drawsSpace()).not.toBeNull();
 
     await userEvent.click(crumb("My Drive"));
@@ -182,7 +182,7 @@ describe("selection", () => {
     await userEvent.fill(page.getByRole("searchbox", { name: "Search Drive" }), "specs");
     await userEvent.click(option("Specs"));
     await userEvent.click(crumb("Engineering"));
-    await expect.element(option(choice.title)).toMatchTextContent(`${choice.title}${choice.subtitle}`);
+    await expect.element(option(choice.title)).toHaveTextContent(`${choice.title}${choice.subtitle}`);
     expect(drawsSpace()).not.toBeNull();
   });
 
@@ -210,11 +210,11 @@ describe("selection", () => {
     };
     await render({ loadItems: async ({ parentId }) => ({ items: parentId === "pages" ? [q1] : [pages, draft] }) });
 
-    await expect.element(option("Draft.docx")).toMatchTextContent("Only its owner can share it.");
+    await expect.element(option("Draft.docx")).toHaveTextContent("Only its owner can share it.");
     expect(option("Draft.docx").element().textContent).not.toContain("Owned by Kim");
     expect(container!.textContent).not.toContain("\u202E");
     // A container's row opens it, so it says what is inside; why it cannot be chosen waits until then.
-    await expect.element(option("Site Pages")).toMatchTextContent("Open to choose a page");
+    await expect.element(option("Site Pages")).toHaveTextContent("Open to choose a page");
 
     await userEvent.click(option("Site Pages"));
     await expect.element(page.getByText("Choose one page, or the whole site.", { exact: true })).toBeVisible();
@@ -276,13 +276,13 @@ describe("selection", () => {
     const loadItem = async (): Promise<Item | null> => ({ id: "epsilon", title: "Epsilon", kind: "container", path });
     await render({ loadItems: source(), loadItem, initial: "epsilon" });
 
-    await expect.element(crumbs()).toMatchTextContent(/^My Drive\s*Delta\s*Epsilon$/);
+    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Delta\s*Epsilon$/);
     await userEvent.click(page.getByRole("button", { name: "Show 3 more levels" }));
     await expect.element(crumb("Alpha")).toHaveFocus();
-    await expect.element(crumbs()).toMatchTextContent(/^My Drive\s*Alpha\s*Beta\s*Gamma\s*Delta\s*Epsilon$/);
+    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Alpha\s*Beta\s*Gamma\s*Delta\s*Epsilon$/);
 
     await userEvent.click(crumb("Delta"));
-    await expect.element(crumbs()).toMatchTextContent(/^My Drive\s*Gamma\s*Delta$/);
+    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Gamma\s*Delta$/);
     await expect.element(page.getByRole("button", { name: "Show 2 more levels" })).toBeVisible();
   });
 
@@ -396,7 +396,7 @@ describe("pre-fill", () => {
     const onChange = await render({ loadItems: source(), loadItem, initial: "reports" });
 
     await expect.element(option("Everything in Reports")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toMatchTextContent(/^My DriveReports$/);
+    await expect.element(crumbs()).toHaveTextContent(/^My DriveReports$/);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -805,12 +805,12 @@ describe("search", () => {
     const search = page.getByRole("searchbox", { name: "Search Drive" });
 
     await userEvent.fill(search, "20");
-    await expect.element(option("2024")).toMatchTextContent("Reports / Archive");
+    await expect.element(option("2024")).toHaveTextContent("Reports / Archive");
     expect(loadItems).toHaveBeenLastCalledWith({ parentId: "drive", query: "20", cursor: null });
 
     await userEvent.click(option("2024"));
     await expect.element(search).toHaveValue("");
-    await expect.element(crumbs()).toMatchTextContent(/^My DriveReportsArchive2024/);
+    await expect.element(crumbs()).toHaveTextContent(/^My DriveReportsArchive2024/);
     await expect.element(crumb("2024")).toHaveAttribute("aria-current", "location");
     await expect.element(option("Everything in 2024")).toBeVisible();
     // The breadcrumb renders before the effect that lists the new location runs.
@@ -830,9 +830,9 @@ describe("search", () => {
     const search = page.getByRole("searchbox", { name: "Search Drive" });
 
     await userEvent.fill(search, "loose");
-    await expect.element(option("Loose")).toMatchTextContent("Owned by Kim");
+    await expect.element(option("Loose")).toHaveTextContent("Owned by Kim");
     await userEvent.click(option("Loose"));
-    await expect.element(crumbs()).toMatchTextContent("My Drive…Loose");
+    await expect.element(crumbs()).toHaveTextContent("My Drive…Loose");
     await expect.element(list()).toHaveAccessibleName("Loose");
   });
 
@@ -1227,20 +1227,20 @@ describe("tabs", () => {
     await expect.element(option("Marketing")).toBeVisible();
     await expect.element(tab("Sites")).toHaveAttribute("aria-selected", "true");
     await expect.element(list()).toHaveAccessibleName("Sites");
-    await expect.element(crumbs()).toMatchTextContent(/^Sites$/);
+    await expect.element(crumbs()).toHaveTextContent(/^Sites$/);
     await expect.element(allOf()).toBeVisible();
     // A tab is offered as a choice only when it says so.
     expect(option("Everything in").elements()).toHaveLength(0);
 
     await userEvent.click(option("Marketing"));
-    await expect.element(crumbs()).toMatchTextContent(/^SitesMarketing$/);
+    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
     await userEvent.click(option("Plan.docx"));
     expect(onChange).toHaveBeenLastCalledWith("plan", expect.objectContaining({ id: "plan" }));
 
     await userEvent.click(tab("Files"));
     await expect.element(option("Notes.txt")).toBeVisible();
     await expect.element(list()).toHaveAccessibleName("Files");
-    await expect.element(crumbs()).toMatchTextContent(/^Files$/);
+    await expect.element(crumbs()).toHaveTextContent(/^Files$/);
     expect(onChange).toHaveBeenLastCalledWith(null, null);
     // The root is never listed: only its tabs are.
     expect(loadItems.mock.calls.map(([request]) => request.parentId)).toEqual(["sites", "marketing", "files"]);
@@ -1254,7 +1254,7 @@ describe("tabs", () => {
     await render({ loadItems, tabs: [recent, ...TABS] });
 
     await userEvent.click(option("Marketing"));
-    await expect.element(crumbs()).toMatchTextContent(/^SitesMarketing$/);
+    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
     await expect.element(tab("Sites")).toHaveAttribute("aria-selected", "true");
     await expect.element(option("Plan.docx")).toBeVisible();
   });
@@ -1296,7 +1296,7 @@ describe("tabs", () => {
 
     await expect.element(option("Notes.txt")).toHaveAttribute("aria-selected", "true");
     await expect.element(tab("Files")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toMatchTextContent(/^Files$/);
+    await expect.element(crumbs()).toHaveTextContent(/^Files$/);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -1306,7 +1306,7 @@ describe("tabs", () => {
     await render({ loadItems: tabbed(), loadItem, tabs: TABS, initial: "plan" });
 
     await expect.element(option("Plan.docx")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toMatchTextContent(/^Sites…Marketing$/);
+    await expect.element(crumbs()).toHaveTextContent(/^Sites…Marketing$/);
   });
 
   it("pins a pre-filled leaf without a path atop the open tab, whose folders open with no gap", async () => {
@@ -1315,11 +1315,11 @@ describe("tabs", () => {
 
     await expect.element(option("Notes.txt")).toHaveAttribute("aria-selected", "true");
     await expect.element(list()).toHaveAccessibleName("Sites");
-    await expect.element(crumbs()).toMatchTextContent(/^Sites$/);
+    await expect.element(crumbs()).toHaveTextContent(/^Sites$/);
     // What the tab lists is its own, so a folder opened from it is known to sit right under it.
     await userEvent.click(option("Marketing"));
     await expect.element(list()).toHaveAccessibleName("Marketing");
-    await expect.element(crumbs()).toMatchTextContent(/^SitesMarketing$/);
+    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
   });
 
   it("shows a pre-filled tab on its own row without looking it up", async () => {
@@ -1356,7 +1356,7 @@ describe("tabs", () => {
     expect(loadItems).toHaveBeenLastCalledWith({ parentId: "sites", query: "old", cursor: null });
     await userEvent.click(option("Old"));
     await expect.element(tab("Files")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toMatchTextContent(/^FilesOld$/);
+    await expect.element(crumbs()).toHaveTextContent(/^FilesOld$/);
     await expect.element(search).toHaveValue("");
 
     await userEvent.fill(search, "notes");
