@@ -10,7 +10,7 @@
     "jsx": "react-jsx",
     "allowImportingTsExtensions": true,
     // No ambient @types: the runtime runs in a browser frame, so Node's globals must not type-check.
-    "types": []
+    "types": ["vitest/browser", "@vitest/browser/matchers"]
   },
   "include": ["src/**/*"],
   "exclude": ["dist", "node_modules"]
