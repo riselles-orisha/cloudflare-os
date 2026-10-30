@@ -276,13 +276,13 @@ describe("selection", () => {
     const loadItem = async (): Promise<Item | null> => ({ id: "epsilon", title: "Epsilon", kind: "container", path });
     await render({ loadItems: source(), loadItem, initial: "epsilon" });
 
-    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Delta\s*Epsilon$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^My Drive\s*Delta\s*Epsilon$/);
     await userEvent.click(page.getByRole("button", { name: "Show 3 more levels" }));
     await expect.element(crumb("Alpha")).toHaveFocus();
-    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Alpha\s*Beta\s*Gamma\s*Delta\s*Epsilon$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^My Drive\s*Alpha\s*Beta\s*Gamma\s*Delta\s*Epsilon$/);
 
     await userEvent.click(crumb("Delta"));
-    await expect.element(crumbs()).toHaveTextContent(/^My Drive\s*Gamma\s*Delta$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^My Drive\s*Gamma\s*Delta$/);
     await expect.element(page.getByRole("button", { name: "Show 2 more levels" })).toBeVisible();
   });
 
@@ -396,7 +396,7 @@ describe("pre-fill", () => {
     const onChange = await render({ loadItems: source(), loadItem, initial: "reports" });
 
     await expect.element(option("Everything in Reports")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toHaveTextContent(/^My DriveReports$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^My DriveReports$/);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -810,7 +810,7 @@ describe("search", () => {
 
     await userEvent.click(option("2024"));
     await expect.element(search).toHaveValue("");
-    await expect.element(crumbs()).toHaveTextContent(/^My DriveReportsArchive2024/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^My DriveReportsArchive2024/);
     await expect.element(crumb("2024")).toHaveAttribute("aria-current", "location");
     await expect.element(option("Everything in 2024")).toBeVisible();
     // The breadcrumb renders before the effect that lists the new location runs.
@@ -1227,20 +1227,20 @@ describe("tabs", () => {
     await expect.element(option("Marketing")).toBeVisible();
     await expect.element(tab("Sites")).toHaveAttribute("aria-selected", "true");
     await expect.element(list()).toHaveAccessibleName("Sites");
-    await expect.element(crumbs()).toHaveTextContent(/^Sites$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^Sites$/);
     await expect.element(allOf()).toBeVisible();
     // A tab is offered as a choice only when it says so.
     expect(option("Everything in").elements()).toHaveLength(0);
 
     await userEvent.click(option("Marketing"));
-    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^SitesMarketing$/);
     await userEvent.click(option("Plan.docx"));
     expect(onChange).toHaveBeenLastCalledWith("plan", expect.objectContaining({ id: "plan" }));
 
     await userEvent.click(tab("Files"));
     await expect.element(option("Notes.txt")).toBeVisible();
     await expect.element(list()).toHaveAccessibleName("Files");
-    await expect.element(crumbs()).toHaveTextContent(/^Files$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^Files$/);
     expect(onChange).toHaveBeenLastCalledWith(null, null);
     // The root is never listed: only its tabs are.
     expect(loadItems.mock.calls.map(([request]) => request.parentId)).toEqual(["sites", "marketing", "files"]);
@@ -1254,7 +1254,7 @@ describe("tabs", () => {
     await render({ loadItems, tabs: [recent, ...TABS] });
 
     await userEvent.click(option("Marketing"));
-    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^SitesMarketing$/);
     await expect.element(tab("Sites")).toHaveAttribute("aria-selected", "true");
     await expect.element(option("Plan.docx")).toBeVisible();
   });
@@ -1296,7 +1296,7 @@ describe("tabs", () => {
 
     await expect.element(option("Notes.txt")).toHaveAttribute("aria-selected", "true");
     await expect.element(tab("Files")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toHaveTextContent(/^Files$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^Files$/);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -1306,7 +1306,7 @@ describe("tabs", () => {
     await render({ loadItems: tabbed(), loadItem, tabs: TABS, initial: "plan" });
 
     await expect.element(option("Plan.docx")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toHaveTextContent(/^Sites…Marketing$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^Sites…Marketing$/);
   });
 
   it("pins a pre-filled leaf without a path atop the open tab, whose folders open with no gap", async () => {
@@ -1315,11 +1315,11 @@ describe("tabs", () => {
 
     await expect.element(option("Notes.txt")).toHaveAttribute("aria-selected", "true");
     await expect.element(list()).toHaveAccessibleName("Sites");
-    await expect.element(crumbs()).toHaveTextContent(/^Sites$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^Sites$/);
     // What the tab lists is its own, so a folder opened from it is known to sit right under it.
     await userEvent.click(option("Marketing"));
     await expect.element(list()).toHaveAccessibleName("Marketing");
-    await expect.element(crumbs()).toHaveTextContent(/^SitesMarketing$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^SitesMarketing$/);
   });
 
   it("shows a pre-filled tab on its own row without looking it up", async () => {
@@ -1356,7 +1356,7 @@ describe("tabs", () => {
     expect(loadItems).toHaveBeenLastCalledWith({ parentId: "sites", query: "old", cursor: null });
     await userEvent.click(option("Old"));
     await expect.element(tab("Files")).toHaveAttribute("aria-selected", "true");
-    await expect.element(crumbs()).toHaveTextContent(/^FilesOld$/);
+    await expect.poll(() => crumbs().element().textContent).toMatch(/^FilesOld$/);
     await expect.element(search).toHaveValue("");
 
     await userEvent.fill(search, "notes");
