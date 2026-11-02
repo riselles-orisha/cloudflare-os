@@ -210,11 +210,11 @@ describe("selection", () => {
     };
     await render({ loadItems: async ({ parentId }) => ({ items: parentId === "pages" ? [q1] : [pages, draft] }) });
 
-    await expect.element(option("Draft.docx")).toHaveTextContent("Only its owner can share it.");
+    await expect.poll(() => option("Draft.docx").element().textContent).toContain("Only its owner can share it.");
     expect(option("Draft.docx").element().textContent).not.toContain("Owned by Kim");
     expect(container!.textContent).not.toContain("\u202E");
     // A container's row opens it, so it says what is inside; why it cannot be chosen waits until then.
-    await expect.element(option("Site Pages")).toHaveTextContent("Open to choose a page");
+    await expect.poll(() => option("Site Pages").element().textContent).toContain("Open to choose a page");
 
     await userEvent.click(option("Site Pages"));
     await expect.element(page.getByText("Choose one page, or the whole site.", { exact: true })).toBeVisible();
@@ -805,7 +805,7 @@ describe("search", () => {
     const search = page.getByRole("searchbox", { name: "Search Drive" });
 
     await userEvent.fill(search, "20");
-    await expect.element(option("2024")).toHaveTextContent("Reports / Archive");
+    await expect.poll(() => option("2024").element().textContent).toContain("Reports / Archive");
     expect(loadItems).toHaveBeenLastCalledWith({ parentId: "drive", query: "20", cursor: null });
 
     await userEvent.click(option("2024"));
@@ -830,7 +830,7 @@ describe("search", () => {
     const search = page.getByRole("searchbox", { name: "Search Drive" });
 
     await userEvent.fill(search, "loose");
-    await expect.element(option("Loose")).toHaveTextContent("Owned by Kim");
+    await expect.poll(() => option("Loose").element().textContent).toContain("Owned by Kim");
     await userEvent.click(option("Loose"));
     await expect.element(crumbs()).toHaveTextContent("My Drive…Loose");
     await expect.element(list()).toHaveAccessibleName("Loose");
